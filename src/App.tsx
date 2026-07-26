@@ -3,7 +3,8 @@ import {
   CloudUpload, Video, Server, Monitor, Play, Pause, Download, Search,
   Film, ScanLine, Activity, X, AlertCircle, CheckCircle2, Layers,
   Sliders, RotateCcw, RefreshCw, ChevronDown, ChevronUp, Repeat,
-  ShieldCheck, Cpu, Zap, Trash2, Database, History
+  ShieldCheck, Cpu, Zap, Trash2, Database, History,
+  ChevronLeft, ChevronRight
 } from 'lucide-react';
 import { processVideoFile, processVideoOnServer } from './VideoProcessor';
 import { clearVideoFingerprints } from './utils/db';
@@ -896,6 +897,50 @@ export default function App() {
     }, 100);
   };
 
+  const navigateSegment = useCallback((delta: -1 | 1) => {
+    if (segments.length === 0) return;
+    setPreviewSegment(prev => {
+      const idx = prev ? segments.indexOf(prev) : -1;
+      const next = idx + delta;
+      if (next < 0 || next >= segments.length) return prev;
+      const seg = segments[next];
+      // Seek both videos to the new segment
+      setTimeout(() => {
+        refVideoRef.current?.pause();
+        clipVideoRef.current?.pause();
+        setTimeout(() => {
+          if (refVideoRef.current) {
+            refVideoRef.current.currentTime  = seg.movieStart;
+            refVideoRef.current.playbackRate = playbackSpeed;
+          }
+          if (clipVideoRef.current) {
+            clipVideoRef.current.currentTime  = seg.shortStart;
+            clipVideoRef.current.playbackRate = playbackSpeed;
+          }
+          setTimeout(() => {
+            refVideoRef.current?.play();
+            clipVideoRef.current?.play();
+            setIsPlaying(true);
+          }, 200);
+        }, 50);
+      }, 0);
+      return seg;
+    });
+  }, [segments, playbackSpeed]);
+
+  // Keyboard navigation: left/right arrows when the preview panel is open
+  useEffect(() => {
+    if (!previewSegment) return;
+    const onKey = (e: KeyboardEvent) => {
+      // Don't intercept when typing in an input/textarea
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.key === 'ArrowRight') { e.preventDefault(); navigateSegment(1); }
+      if (e.key === 'ArrowLeft')  { e.preventDefault(); navigateSegment(-1); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [previewSegment, navigateSegment]);
+
   const handleSyncPlay = () => {
     if (!refVideoRef.current || !clipVideoRef.current) return;
     if (isPlaying) {
@@ -1522,28 +1567,77 @@ export default function App() {
           <section className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl">
 
             {/* Panel header */}
-            <div className="p-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <div className="bg-blue-500/10 p-1.5 rounded-lg border border-blue-500/20">
-                  <Video className="w-4 h-4 text-blue-400" />
+            {(() => {
+              const segIdx = segments.indexOf(previewSegment);
+              const hasPrev = segIdx > 0;
+              const hasNext = segIdx < segments.length - 1;
+              return (
+                <div className="p-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
+                  {/* Left: icon + title */}
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="bg-blue-500/10 p-1.5 rounded-lg border border-blue-500/20 shrink-0">
+                      <Video className="w-4 h-4 text-blue-400" />
+                    </div>
+                    <div className="min-w-0">
+                      <h3 className="text-sm font-semibold text-white flex items-center gap-2 flex-wrap">
+                        Side-by-Side Comparison
+                        <ConfidenceBadge confidence={previewSegment.confidence} isApproximate={previewSegment.isApproximate} />
+                      </h3>
+                      <p className="text-xs text-slate-500 font-mono truncate">
+                        Clip {fmt(previewSegment.shortStart)}–{fmt(previewSegment.shortEnd)} ({fmtDur(previewSegment.shortEnd - previewSegment.shortStart)}) ·
+                        Movie {fmt(previewSegment.movieStart)}–{fmt(previewSegment.movieEnd)} ·
+                        {previewSegment.frameCount} frames
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Right: nav controls + close */}
+                  <div className="flex items-center gap-2 shrink-0">
+                    {/* Prev button */}
+                    <button
+                      onClick={() => navigateSegment(-1)}
+                      disabled={!hasPrev}
+                      title="Previous segment (←)"
+                      className={`flex items-center gap-1 px-3 py-2 rounded-lg text-xs font-medium border transition cursor-pointer
+                        ${hasPrev
+                          ? 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300 hover:text-white'
+                          : 'bg-slate-900 border-slate-800 text-slate-600 cursor-not-allowed'}`}>
+                      <ChevronLeft className="w-3.5 h-3.5" />
+                      <span className="hidden sm:inline">Prev</span>
+                    </button>
+
+                    {/* Position counter */}
+                    {segments.length > 0 && (
+                      <span className="text-xs font-mono text-slate-400 whitespace-nowrap px-1">
+                        {segIdx >= 0 ? segIdx + 1 : '?'} <span className="text-slate-600">of</span> {segments.length}
+                      </span>
+                    )}
+
+                    {/* Next button */}
+                    <button
+                      onClick={() => navigateSegment(1)}
+                      disabled={!hasNext}
+                      title="Next segment (→)"
+                      className={`flex items-center gap-1 px-3 py-2 rounded-lg text-xs font-medium border transition cursor-pointer
+                        ${hasNext
+                          ? 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300 hover:text-white'
+                          : 'bg-slate-900 border-slate-800 text-slate-600 cursor-not-allowed'}`}>
+                      <span className="hidden sm:inline">Next</span>
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+
+                    {/* Divider */}
+                    <div className="w-px h-5 bg-slate-700 mx-1" />
+
+                    {/* Close */}
+                    <button onClick={() => { setPreviewSegment(null); setIsPlaying(false); refVideoRef.current?.pause(); clipVideoRef.current?.pause(); }}
+                      className="p-1.5 text-slate-500 hover:text-slate-300 rounded-lg hover:bg-slate-800 transition cursor-pointer">
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
-                <div>
-                  <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                    Side-by-Side Comparison
-                    <ConfidenceBadge confidence={previewSegment.confidence} isApproximate={previewSegment.isApproximate} />
-                  </h3>
-                  <p className="text-xs text-slate-500 font-mono">
-                    Clip {fmt(previewSegment.shortStart)}–{fmt(previewSegment.shortEnd)} ({fmtDur(previewSegment.shortEnd - previewSegment.shortStart)}) ·
-                    Movie {fmt(previewSegment.movieStart)}–{fmt(previewSegment.movieEnd)} ·
-                    {previewSegment.frameCount} frames
-                  </p>
-                </div>
-              </div>
-              <button onClick={() => { setPreviewSegment(null); setIsPlaying(false); refVideoRef.current?.pause(); clipVideoRef.current?.pause(); }}
-                className="p-1.5 text-slate-500 hover:text-slate-300 rounded-lg hover:bg-slate-800 transition cursor-pointer">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+              );
+            })()}
 
             {/* Playback controls bar */}
             <div className="px-4 py-3 border-b border-slate-800 bg-slate-950/50 flex flex-wrap items-center gap-3">

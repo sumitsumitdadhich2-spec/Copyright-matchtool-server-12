@@ -16,6 +16,7 @@ import * as os from 'os';
 import * as readline from 'readline';
 import { FrameSignature, VariantHashes } from '../src/shared/fingerprint';
 import { loadEmbeddingsFile, cosineSimilarity } from './embedding';
+import { refineWithDTW } from './dtw-align';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -582,7 +583,7 @@ function embeddingSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): numbe
   return ((Math.max(-1, Math.min(1, dot)) + 1) / 2) * 100;
 }
 
-function frameSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): number {
+export function frameSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): number {
   const hSim = hashSimBestCross(sSet, si, mSet, mi);
   const sSig = sSet.fps[si].signature;
   const mSig = mSet.fps[mi].signature;
@@ -1747,8 +1748,21 @@ export async function groundMatchedSegments(
     console.log(`[Matcher] Context validation: dropped ${final.length - contextValidated.length} segment(s).`);
   }
 
+  // DTW refinement: attempt re-alignment for borderline-confidence segments and
+  // segments with implausible speedRatio before the speed-ratio filter drops them.
+  // Only applied to the already-narrowed candidate regions — never the full movie.
+  const dtwRefined = refineWithDTW(
+    contextValidated,
+    (si, mi) => frameSim(sSet, si, mSet, mi),
+    shortFps,
+    movieFps,
+  );
+  if (dtwRefined.length !== contextValidated.length) {
+    console.log(`[Matcher] DTW refinement: changed ${contextValidated.length - dtwRefined.length} segment(s).`);
+  }
+
   // SpeedRatio validation: drop segments with implausible temporal duration ratios.
-  const speedRatioValidated = speedRatioFilterSegments(contextValidated);
+  const speedRatioValidated = speedRatioFilterSegments(dtwRefined);
   if (speedRatioValidated.length !== contextValidated.length) {
     console.log(`[Matcher] SpeedRatio validation: dropped ${contextValidated.length - speedRatioValidated.length} segment(s).`);
   }

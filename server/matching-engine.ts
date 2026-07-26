@@ -1145,6 +1145,104 @@ function speedRatioFilterSegments(segs: MatchedSegment[]): MatchedSegment[] {
 }
 
 /**
+ * Sequence-consistency validation — rejects isolated segments whose movie
+ * timeline position is a large, one-off jump away from both surrounding
+ * neighbours.
+ *
+ * The short clip always plays linearly, so the movieStart of each segment
+ * (sorted by shortStart) should progress monotonically in roughly the same
+ * direction.  An isolated segment that jumps far from the previous segment
+ * AND from which the next segment also jumps far — but where both neighbours
+ * are close to each other — is an outlier: a false-positive match in a
+ * distant, unrelated part of the movie.
+ *
+ * Runs of multiple consecutive segments at a new movie location are NOT
+ * dropped — they represent genuine repeated / reused footage.  A run is
+ * detected by the fact that the next segment continues the new location
+ * (gapAfter ≤ JUMP_THRESHOLD), so the outlier condition (large gapAfter)
+ * does not fire.
+ *
+ * This filter receives the list that has already been through speedRatio
+ * filtering, so that already-removed false positives do not distort the
+ * neighbour-gap calculations.  All drops are independently logged with
+ * [Matcher] Sequence-drop so they can be audited separately from
+ * [Matcher] SpeedRatio-drop events.
+ */
+function sequenceConsistencyFilter(segs: MatchedSegment[]): MatchedSegment[] {
+  if (segs.length <= 2) return segs; // need at least 3 to detect isolation
+
+  // A jump larger than this (seconds in movie time) from both neighbours
+  // is considered suspicious.  30 s allows legitimate forward scene cuts
+  // while reliably catching the 400 s+ outliers we observe as false positives.
+  const JUMP_THRESHOLD = 30;
+
+  // ── Pass 1: Mark candidates ──────────────────────────────────────────────
+  // Flag every segment that is far (> JUMP_THRESHOLD) from BOTH immediate
+  // neighbours as suspicious.  This is only a candidate list — a genuine
+  // good segment sandwiched between two bad ones will also be flagged here.
+  // Pass 2 resolves the ambiguity by using non-suspicious context instead.
+  const suspicious = new Array<boolean>(segs.length).fill(false);
+  for (let i = 1; i < segs.length - 1; i++) {
+    const prev = segs[i - 1], seg = segs[i], next = segs[i + 1];
+    if (
+      Math.abs(seg.movieStart  - prev.movieEnd) > JUMP_THRESHOLD &&
+      Math.abs(next.movieStart - seg.movieEnd)  > JUMP_THRESHOLD
+    ) {
+      suspicious[i] = true;
+    }
+  }
+
+  // ── Pass 2: Confirm drops with trusted (non-suspicious) context ──────────
+  // For each suspicious segment, skip over other suspicious neighbours when
+  // searching for context.  This ensures a good segment that happens to sit
+  // between two bad ones is evaluated against the wider non-suspicious thread
+  // and found to be close to it — so it is correctly kept.
+  const dropMask = new Array<boolean>(segs.length).fill(false);
+
+  for (let i = 0; i < segs.length; i++) {
+    if (!suspicious[i]) continue;
+
+    // Nearest non-suspicious segment to the left.
+    let prevIdx = -1;
+    for (let j = i - 1; j >= 0; j--) {
+      if (!suspicious[j]) { prevIdx = j; break; }
+    }
+    // Nearest non-suspicious segment to the right.
+    let nextIdx = -1;
+    for (let j = i + 1; j < segs.length; j++) {
+      if (!suspicious[j]) { nextIdx = j; break; }
+    }
+
+    // No clean context on one side → cannot confirm isolation → keep.
+    if (prevIdx < 0 || nextIdx < 0) continue;
+
+    const prev = segs[prevIdx], seg = segs[i], next = segs[nextIdx];
+    const gapBefore = Math.abs(seg.movieStart  - prev.movieEnd);
+    const gapAfter  = Math.abs(next.movieStart - seg.movieEnd);
+
+    // Connected to at least one trusted neighbour → part of a legitimate run → keep.
+    if (gapBefore <= JUMP_THRESHOLD || gapAfter <= JUMP_THRESHOLD) continue;
+
+    // Both trusted neighbours are far.  Isolation is confirmed when they are
+    // substantially closer to each other than to this segment — meaning the
+    // sequence flows coherently without it.
+    const neighborGap = Math.abs(next.movieStart - prev.movieEnd);
+    if (neighborGap < gapBefore * 0.5 && neighborGap < gapAfter * 0.5) {
+      dropMask[i] = true;
+      console.log(
+        `[Matcher] Sequence-drop: seg [${seg.shortStart.toFixed(2)}–` +
+        `${seg.shortEnd.toFixed(2)}s] jumped to movie ${seg.movieStart.toFixed(2)}s,` +
+        ` inconsistent with surrounding sequence` +
+        ` (neighbors at movie ~${prev.movieEnd.toFixed(0)}s` +
+        ` and ~${next.movieStart.toFixed(0)}s) — rejected.`
+      );
+    }
+  }
+
+  return segs.filter((_, i) => !dropMask[i]);
+}
+
+/**
  * Merge consecutive segments where:
  *  - The gap in the short clip is small (< SHORT_GAP_MAX seconds)
  *  - The movie timeline is progressing forward and proportionally
@@ -1514,9 +1612,15 @@ export async function groundMatchedSegments(
   }
 
   // SpeedRatio validation: drop segments with implausible temporal duration ratios.
-  const validated = speedRatioFilterSegments(contextValidated);
-  if (validated.length !== contextValidated.length) {
-    console.log(`[Matcher] SpeedRatio validation: dropped ${contextValidated.length - validated.length} segment(s).`);
+  const speedRatioValidated = speedRatioFilterSegments(contextValidated);
+  if (speedRatioValidated.length !== contextValidated.length) {
+    console.log(`[Matcher] SpeedRatio validation: dropped ${contextValidated.length - speedRatioValidated.length} segment(s).`);
+  }
+
+  // Sequence-consistency validation: reject isolated position outliers.
+  const validated = sequenceConsistencyFilter(speedRatioValidated);
+  if (validated.length !== speedRatioValidated.length) {
+    console.log(`[Matcher] Sequence validation: dropped ${speedRatioValidated.length - validated.length} segment(s).`);
   }
 
   const tToSi = new Map<string, number>();
@@ -2160,9 +2264,15 @@ async function groundMatchedSegmentsChunked(
   }
 
   // SpeedRatio validation: drop segments with implausible temporal duration ratios.
-  const validated = speedRatioFilterSegments(contextValidated2);
-  if (validated.length !== contextValidated2.length) {
-    console.log(`[MatchChunked] SpeedRatio validation: dropped ${contextValidated2.length - validated.length} segment(s).`);
+  const speedRatioValidated2 = speedRatioFilterSegments(contextValidated2);
+  if (speedRatioValidated2.length !== contextValidated2.length) {
+    console.log(`[MatchChunked] SpeedRatio validation: dropped ${contextValidated2.length - speedRatioValidated2.length} segment(s).`);
+  }
+
+  // Sequence-consistency validation: reject isolated position outliers.
+  const validated = sequenceConsistencyFilter(speedRatioValidated2);
+  if (validated.length !== speedRatioValidated2.length) {
+    console.log(`[MatchChunked] Sequence validation: dropped ${speedRatioValidated2.length - validated.length} segment(s).`);
   }
 
   const tToSi = new Map<string, number>();

@@ -123,6 +123,19 @@ const ADAPTIVE_FLOOR         = 40;
 
 /** Multi-candidate seeding */
 const MAX_SEED_CANDIDATES = 8;
+
+/**
+ * SpeedRatio validity window.
+ * Segments whose regression-computed speedRatio (movie-frames-per-short-frame)
+ * falls outside [MIN_SPEED_RATIO, MAX_SPEED_RATIO] are implausible duration
+ * relationships — e.g. a 2 s short-clip window matching a 0.2 s movie window
+ * (speedRatio ≈ 0.1) — and are rejected as false positives.
+ *
+ * Bounds are generous enough to accept genuine slow-motion (0.5×) and
+ * timelapse/sped-up (2×) edits while reliably rejecting the ~0.1 cluster.
+ */
+const MIN_SPEED_RATIO = 0.4;
+const MAX_SPEED_RATIO = 2.5;
 /** Candidates closer than this many movie frames are merged (2 s @ 25 fps) */
 const SEED_SEPARATION = 50;
 
@@ -1103,6 +1116,35 @@ function contextValidateSegments(segs: MatchedSegment[]): MatchedSegment[] {
 }
 
 /**
+ * SpeedRatio validation — rejects segments whose temporal duration ratio is
+ * implausible (too far from 1.0 in either direction).
+ *
+ * A speedRatio of ~0.1 means the algorithm matched a long short-clip window
+ * (e.g. 2 s) against an implausibly short movie window (e.g. 0.2 s).  This
+ * is never a real speed edit; it is a false-positive produced by the walk
+ * locking onto a high-similarity frame cluster that happens to be temporally
+ * compressed in the movie.
+ *
+ * Segments with speedRatio ∈ [MIN_SPEED_RATIO, MAX_SPEED_RATIO] are kept;
+ * all others are dropped and their short-clip frames become unmatchedRanges.
+ */
+function speedRatioFilterSegments(segs: MatchedSegment[]): MatchedSegment[] {
+  const out: MatchedSegment[] = [];
+  for (const seg of segs) {
+    if (seg.speedRatio >= MIN_SPEED_RATIO && seg.speedRatio <= MAX_SPEED_RATIO) {
+      out.push(seg);
+    } else {
+      console.log(
+        `[Matcher] SpeedRatio-drop: seg [${seg.shortStart.toFixed(2)}–` +
+        `${seg.shortEnd.toFixed(2)}s] speedRatio=${seg.speedRatio.toFixed(3)}` +
+        ` — implausible duration ratio, rejected.`
+      );
+    }
+  }
+  return out;
+}
+
+/**
  * Merge consecutive segments where:
  *  - The gap in the short clip is small (< SHORT_GAP_MAX seconds)
  *  - The movie timeline is progressing forward and proportionally
@@ -1466,9 +1508,15 @@ export async function groundMatchedSegments(
 
   // Context-aware validation: drop low-confidence segments that have no
   // high-confidence neighbour confirming a consistent movie timeline.
-  const validated = contextValidateSegments(final);
-  if (validated.length !== final.length) {
-    console.log(`[Matcher] Context validation: dropped ${final.length - validated.length} segment(s).`);
+  const contextValidated = contextValidateSegments(final);
+  if (contextValidated.length !== final.length) {
+    console.log(`[Matcher] Context validation: dropped ${final.length - contextValidated.length} segment(s).`);
+  }
+
+  // SpeedRatio validation: drop segments with implausible temporal duration ratios.
+  const validated = speedRatioFilterSegments(contextValidated);
+  if (validated.length !== contextValidated.length) {
+    console.log(`[Matcher] SpeedRatio validation: dropped ${contextValidated.length - validated.length} segment(s).`);
   }
 
   const tToSi = new Map<string, number>();
@@ -2106,9 +2154,15 @@ async function groundMatchedSegmentsChunked(
   }
   deduped.sort((a, b) => a.shortStart - b.shortStart);
 
-  const validated = contextValidateSegments(deduped);
-  if (validated.length !== deduped.length) {
-    console.log(`[MatchChunked] Context validation: dropped ${deduped.length - validated.length} segment(s).`);
+  const contextValidated2 = contextValidateSegments(deduped);
+  if (contextValidated2.length !== deduped.length) {
+    console.log(`[MatchChunked] Context validation: dropped ${deduped.length - contextValidated2.length} segment(s).`);
+  }
+
+  // SpeedRatio validation: drop segments with implausible temporal duration ratios.
+  const validated = speedRatioFilterSegments(contextValidated2);
+  if (validated.length !== contextValidated2.length) {
+    console.log(`[MatchChunked] SpeedRatio validation: dropped ${contextValidated2.length - validated.length} segment(s).`);
   }
 
   const tToSi = new Map<string, number>();

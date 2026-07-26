@@ -146,6 +146,34 @@ const SEED_SEPARATION = 50;
 const SLOPE_MIN = 0.1;
 const SLOPE_MAX = 8.0;
 
+// ---------------------------------------------------------------------------
+// Low-detail / degenerate frame gate
+// ---------------------------------------------------------------------------
+/**
+ * Frames whose detailGrid mean-MAD falls below LOW_DETAIL_SOFT_THRESHOLD *and*
+ * whose cell-luminance standard deviation falls below LOW_DETAIL_COLOR_THRESHOLD
+ * are considered "low-information" (near-blank, fade-to-black, solid-colour fill).
+ *
+ * Two severity bands:
+ *   hard-low: truly degenerate (near-blank, white-flash).  The movie-side frame
+ *             alone is enough to trigger the gate.
+ *   soft-low: somewhat flat.  Both the movie AND the short frame must be flagged
+ *             before the gate fires, so a simple-but-real frame (sky, clean BG)
+ *             only gates when it also matches a similarly flat short frame.
+ *
+ * Genuine logo-card or solid-colour-scene matches are unaffected because their
+ * per-cell luminance *varies* across the 4×4 grid (logo vs. background), giving
+ * a colorVar well above LOW_DETAIL_COLOR_THRESHOLD.
+ *
+ * When the gate fires the required similarity is raised by LOW_DETAIL_SIM_BOOST %.
+ * Truly identical (real) matches easily clear this bar; spurious hash collisions
+ * on near-blank content (the false-positive root cause) do not.
+ */
+const LOW_DETAIL_HARD_THRESHOLD  =  5.0;  // detailGrid mean MAD (0–255): definitely degenerate
+const LOW_DETAIL_SOFT_THRESHOLD  = 12.0;  // detailGrid mean MAD (0–255): suspicious
+const LOW_DETAIL_COLOR_THRESHOLD = 12.0;  // cell-luminance std-dev (0–255): structurally flat
+const LOW_DETAIL_SIM_BOOST       = 15;    // extra similarity % required when gate triggers
+
 /** aHash weight vs dHash weight when both are available (no pHash) */
 const A_WEIGHT = 0.55;
 const D_WEIGHT = 0.45;
@@ -690,6 +718,49 @@ function shortConsecutiveSim(sSet: PreSet, si: number): number {
 }
 
 /**
+ * Classify a single frame's intrinsic information content using its signature.
+ *
+ * Returns:
+ *   'hard-low' — truly degenerate: near-blank, fade-to-black, white-flash.
+ *                detailGrid mean < LOW_DETAIL_HARD_THRESHOLD AND colorVar < LOW_DETAIL_COLOR_THRESHOLD.
+ *   'soft-low' — partially flat: low texture + uniform colour.
+ *                detailGrid mean < LOW_DETAIL_SOFT_THRESHOLD AND colorVar < LOW_DETAIL_COLOR_THRESHOLD.
+ *   'normal'   — has meaningful visual content (returned when signature is absent too).
+ *
+ * NOTE: frames without a signature always return 'normal' so the gate is never
+ * triggered on fingerprints that pre-date signature computation.
+ */
+function frameInfoLevel(fp: FPData): 'normal' | 'soft-low' | 'hard-low' {
+  const sig = fp.signature;
+  if (!sig || sig.detailGrid.length === 0) return 'normal';
+
+  // detailGrid: 16 values, each = mean-absolute-deviation of grayscale in a 4×4 cell (0–255)
+  const detailMean = sig.detailGrid.reduce((a, v) => a + v, 0) / sig.detailGrid.length;
+
+  // colorVar: std-dev of per-cell luminance across the 4×4 spatial grid.
+  // A solid near-black or near-white frame has colorVar ≈ 0.
+  // A logo card (logo vs background) has distinct cells → high colorVar → passes as 'normal'.
+  let colorVar = 128; // default: assume structured when colorGrid unavailable
+  if (sig.colorGrid.length === 48) {
+    let lumSum = 0;
+    const lums = new Array<number>(16);
+    for (let i = 0; i < 16; i++) {
+      const l = 0.299 * sig.colorGrid[i * 3]
+              + 0.587 * sig.colorGrid[i * 3 + 1]
+              + 0.114 * sig.colorGrid[i * 3 + 2];
+      lums[i] = l;
+      lumSum += l;
+    }
+    const lumMean = lumSum / 16;
+    colorVar = Math.sqrt(lums.reduce((a, v) => a + (v - lumMean) ** 2, 0) / 16);
+  }
+
+  if (detailMean < LOW_DETAIL_HARD_THRESHOLD && colorVar < LOW_DETAIL_COLOR_THRESHOLD) return 'hard-low';
+  if (detailMean < LOW_DETAIL_SOFT_THRESHOLD && colorVar < LOW_DETAIL_COLOR_THRESHOLD) return 'soft-low';
+  return 'normal';
+}
+
+/**
  * Detect scene cuts in the short clip using three independent signals.
  * A frame is a cut if ANY signal exceeds its threshold:
  *
@@ -868,6 +939,52 @@ function walkOneDir(
     }
 
     if (best >= adaptiveMin && bestMi >= 0) {
+      // ── Low-detail gate (primary false-positive filter) ──────────────────
+      // Transitions, fades, and near-blank movie frames have low visual
+      // information.  Their hashes match *any* similarly flat short-clip
+      // frame, producing the frozen-movieTime / speedRatio≈0.1 pattern.
+      //
+      // Gate logic:
+      //   • hard-low movie frame alone → gate fires (no useful anchor).
+      //   • soft-low movie + soft-low short → gate fires (both sides flat).
+      //   • soft-low on one side only → normal signals decide (logo-card etc.).
+      //
+      // When the gate fires we require extra similarity (LOW_DETAIL_SIM_BOOST)
+      // before accepting the match.  Genuinely-identical frames (real content)
+      // easily clear this bar; spurious collisions on near-blank data do not.
+      // Frames without a signature (no detailGrid) are always treated as normal.
+      const sLevel = frameInfoLevel(sSet.fps[nextSi]);
+      const mLevel = frameInfoLevel(mSet.fps[bestMi]);
+      const gateActive =
+        mLevel === 'hard-low' ||
+        (mLevel === 'soft-low' && sLevel !== 'normal') ||
+        (sLevel === 'soft-low' && mLevel !== 'normal');
+
+      if (gateActive) {
+        const boostedMin = Math.min(96, adaptiveMin + LOW_DETAIL_SIM_BOOST);
+        if (best < boostedMin) {
+          const mSig = mSet.fps[bestMi].signature;
+          const sSig = sSet.fps[nextSi].signature;
+          const mDetailStr = mSig
+            ? (mSig.detailGrid.reduce((a, v) => a + v, 0) / mSig.detailGrid.length).toFixed(1)
+            : 'n/a';
+          const sDetailStr = sSig
+            ? (sSig.detailGrid.reduce((a, v) => a + v, 0) / sSig.detailGrid.length).toFixed(1)
+            : 'n/a';
+          console.log(
+            `[Matcher] Low-detail skip: movie frame at ${mSet.fps[bestMi].timestamp.toFixed(2)}s` +
+            ` (detailScore=${mDetailStr}, level=${mLevel})` +
+            ` short at ${sSet.fps[nextSi].timestamp.toFixed(2)}s` +
+            ` (detailScore=${sDetailStr}, level=${sLevel})` +
+            ` — sim=${best.toFixed(1)}% < boosted min ${boostedMin}%`
+          );
+          missCount++;
+          if (missCount >= GAP_LOOKAHEAD) break;
+          continue;
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
       seq.push({ si: nextSi, mi: bestMi, sim: best });
       lastGoodSi = nextSi;
       lastGoodMi = bestMi;
@@ -1458,6 +1575,25 @@ export async function groundMatchedSegments(
         for (const cand of topCands) {
           const seedSim = frameSim(sSet, si, mSet, cand.mi);
           if (seedSim < passMinSim) continue;
+
+          // Low-detail seed gate: skip seeds rooted in near-blank / fade frames
+          // using the same logic as the walk gate above.
+          {
+            const sSeedLevel = frameInfoLevel(sSet.fps[si]);
+            const mSeedLevel = frameInfoLevel(mSet.fps[cand.mi]);
+            const seedGateActive =
+              mSeedLevel === 'hard-low' ||
+              (mSeedLevel === 'soft-low' && sSeedLevel !== 'normal') ||
+              (sSeedLevel === 'soft-low' && mSeedLevel !== 'normal');
+            if (seedGateActive && seedSim < passMinSim + LOW_DETAIL_SIM_BOOST) {
+              console.log(
+                `[Matcher] Low-detail seed skip: movie ${mSet.fps[cand.mi].timestamp.toFixed(2)}s` +
+                ` (level=${mSeedLevel}) short ${sSet.fps[si].timestamp.toFixed(2)}s` +
+                ` (level=${sSeedLevel}) — sim=${seedSim.toFixed(1)}% < ${passMinSim + LOW_DETAIL_SIM_BOOST}%`
+              );
+              continue;
+            }
+          }
 
           const seq = buildSegment(
             sSet, mSet, si, cand.mi, seedSim,

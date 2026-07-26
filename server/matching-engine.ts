@@ -2587,6 +2587,7 @@ import { promisify } from 'util';
 import * as path from 'path';
 import { getObjectSignal, compareObjectSignals, initObjectSignal } from './object-signal';
 import { getFaceSignal, compareFaceSignals, initFaceSignal } from './face-signal';
+import { getKeypointSignal, compareKeypointSignals, initKeypointSignal } from './keypoint-signal';
 import { createCanvas, loadImage } from 'canvas';
 
 const execAsync = promisify(exec);
@@ -2636,6 +2637,7 @@ async function enhanceBorderlineSegments(result: MatchResult, shortResultPath: s
   const BORDERLINE_MAX = 75;
   const FACE_SIM_THRESHOLD = 80;
   const OBJECT_SIM_THRESHOLD = 60;
+  const KEYPOINT_SIM_THRESHOLD = 30;  // keypointSim (0–100) required to confirm a borderline match
   
   const borderlineSegments = result.segments.filter(s => s.confidence >= BORDERLINE_MIN && s.confidence <= BORDERLINE_MAX);
   if (borderlineSegments.length === 0) return result;
@@ -2644,6 +2646,7 @@ async function enhanceBorderlineSegments(result: MatchResult, shortResultPath: s
   
   await initFaceSignal();
   await initObjectSignal();
+  initKeypointSignal();
   
   const shortVideoPath = await getVideoPathFromResultPath(shortResultPath);
   const movieVideoPath = await getVideoPathFromResultPath(movieResultPath);
@@ -2697,10 +2700,49 @@ async function enhanceBorderlineSegments(result: MatchResult, shortResultPath: s
         if (objSimRes.score > OBJECT_SIM_THRESHOLD) {
           const boost = Math.max(82 - seg.confidence + 1, 0);
           seg.confidence += boost;
+          boosted = true;
           console.log(`[ObjectSignal] Borderline match at frame ${frameMatch.shortTime}s confirmed by object similarity (objectSim=${objSimRes.score.toFixed(1)}%, shared categories: ${objSimRes.sharedCategories.join(', ')}). Boosted confidence to ${seg.confidence.toFixed(1)}%.`);
         }
       } else {
         console.log(`[Enhancer] No objects detected in one or both frames.`);
+      }
+    }
+
+    if (!boosted) {
+      // ── ORB-lite keypoint signal ─────────────────────────────────────────
+      // Additive confirming signal only — same constraint as face/object:
+      // never overrides a clear non-match, never downgrades a clear match,
+      // only resolves genuinely ambiguous borderline cases.
+      //
+      // Particularly useful when heavy cropping, perspective shift, or partial
+      // occlusion causes hash/CLIP similarity to drop while distinctive
+      // geometric points remain geometrically consistent between the two frames.
+      //
+      // Docker size increase: 0 (pure TypeScript, no new npm deps).
+      // Added second-pass time: ~2–8 ms per segment pair.
+      const kpT0 = Date.now();
+      const shortKp = getKeypointSignal(shortImageData);
+      const movieKp = getKeypointSignal(movieImageData);
+      const kpMatch = compareKeypointSignals(shortKp, movieKp);
+      const kpMs    = Date.now() - kpT0;
+
+      console.log(
+        `[KeypointSignal] Borderline match at frame ${frameMatch.shortTime.toFixed(2)}s` +
+        ` — ORB keypoints: short=${shortKp.count} movie=${movieKp.count}` +
+        ` good=${kpMatch.goodMatches} keypointSim=${kpMatch.keypointSim.toFixed(1)}%` +
+        ` (${kpMs} ms)`
+      );
+
+      if (kpMatch.keypointSim > KEYPOINT_SIM_THRESHOLD) {
+        const boost = Math.max(82 - seg.confidence + 1, 0);
+        seg.confidence += boost;
+        console.log(
+          `[KeypointSignal] Borderline match at frame ${frameMatch.shortTime.toFixed(2)}s` +
+          ` confirmed by ORB keypoint matching` +
+          ` (${kpMatch.goodMatches} strong matches out of ${Math.min(shortKp.count, movieKp.count)} detected,` +
+          ` keypointSim=${kpMatch.keypointSim.toFixed(1)}%).` +
+          ` Boosted confidence to ${seg.confidence.toFixed(1)}%.`
+        );
       }
     }
   }

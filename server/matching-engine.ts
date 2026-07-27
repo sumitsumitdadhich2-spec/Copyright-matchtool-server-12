@@ -137,8 +137,8 @@ const MAX_SEED_CANDIDATES = 8;
  * Bounds are generous enough to accept genuine slow-motion (0.5×) and
  * timelapse/sped-up (2×) edits while reliably rejecting the ~0.1 cluster.
  */
-const MIN_SPEED_RATIO = 0.4;
-const MAX_SPEED_RATIO = 2.5;
+const MIN_SPEED_RATIO = 0.75; // FIX-3: tightened from 0.4 — rejects stuck-frame artifacts
+const MAX_SPEED_RATIO = 1.25; // FIX-3: tightened from 2.5 — real edits stay in this range
 /** Candidates closer than this many movie frames are merged (2 s @ 25 fps) */
 const SEED_SEPARATION = 50;
 
@@ -415,15 +415,20 @@ function hashSimFastCross(
 function hashSimBestCross(
   sSet: PreSet, si: number,
   mSet: PreSet, mi: number
-): number {
-  let best = 0;
+): { sim: number; is9x16: boolean } {
+  let best = 0, bestSvi = 0, bestMvi = 0;
   for (let svi = 0; svi < sSet.numVariants; svi++) {
     for (let mvi = 0; mvi < mSet.numVariants; mvi++) {
       const sim = pairSim(sSet, si, svi, mSet, mi, mvi);
-      if (sim > best) best = sim;
+      if (sim > best) { best = sim; bestSvi = svi; bestMvi = mvi; }
     }
   }
-  return best;
+  // FIX-5: detect if the winning variant pair involves a 9:16 crop — gSim is
+  // unreliable in this case because 50 % of the frame area is absent.
+  const sName  = sSet.variantNames[bestSvi] ?? '';
+  const mName  = mSet.variantNames[bestMvi] ?? '';
+  const is9x16 = sName.startsWith('crop_9_16_') || mName.startsWith('crop_9_16_');
+  return { sim: best, is9x16 };
 }
 
 /** Z-score normalize a 48-value colorGrid per channel (R, G, B) */
@@ -586,7 +591,7 @@ function embeddingSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): numbe
 }
 
 export function frameSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): number {
-  const hSim = hashSimBestCross(sSet, si, mSet, mi);
+  const { sim: hSim, is9x16 } = hashSimBestCross(sSet, si, mSet, mi);
   const sSig = sSet.fps[si].signature;
   const mSig = mSet.fps[mi].signature;
   const tSim = temporalSim(sSet, si, mSet, mi);
@@ -595,6 +600,12 @@ export function frameSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): nu
   const hasEmb = eSim >= 0;
 
   if (sSig && mSig) {
+    // FIX-5: 9:16 crop match — gSim (color grid) is unreliable because ~50 % of
+    // the frame area is absent.  Zero its weight and redistribute to hSim / eSim.
+    if (is9x16) {
+      if (hasEmb) return hSim * 0.75 + eSim * 0.25;
+      return hSim; // no CLIP and no reliable gSim — pure hash score
+    }
     const gSim = signatureSim(sSig, mSig);
     if (hasEmb) {
       // All four signals: hash (84 % base) + spatial signature + temporal motion + CLIP
@@ -648,7 +659,7 @@ function getFrameDetail(sSet: PreSet, si: number, mSet: PreSet, mi: number): Fra
   }
 
   // ── Structure sim (hash-based, 0–100) ──
-  const structureSim = hashSimBestCross(sSet, si, mSet, mi);
+  const structureSim = hashSimBestCross(sSet, si, mSet, mi).sim;
 
   // ── Signature-based breakdown ──
   const sSig = sSet.fps[si].signature;
@@ -784,9 +795,9 @@ function frameInfoLevel(fp: FPData): 'normal' | 'soft-low' | 'hard-low' {
  */
 function detectSceneCuts(
   sSet: PreSet,
-  aThreshold       = 25,
-  dThreshold       = 28,
-  colorMagThreshold = 100
+  aThreshold        = 32,  // FIX-1: tightened from 25 — catches hard cuts reliably
+  dThreshold        = 34,  // FIX-1: tightened from 28
+  colorMagThreshold = 85   // FIX-1: lowered from 100 — more sensitive to color jumps
 ): Uint8Array {
   const isCut = new Uint8Array(sSet.fps.length);
 
@@ -1362,6 +1373,103 @@ function sequenceConsistencyFilter(segs: MatchedSegment[]): MatchedSegment[] {
   return segs.filter((_, i) => !dropMask[i]);
 }
 
+// FIX-4: drop leading/trailing frames whose similarity is below SIM_CUTOFF.
+// Segments that shrink below MIN_FRAMES_AFTER are removed entirely.
+function trimLowSimFrames(segs: MatchedSegment[]): MatchedSegment[] {
+  const SIM_CUTOFF       = 75; // FIX-4: hard cutoff for individual frame similarity
+  const MIN_FRAMES_AFTER = 3;  // FIX-4: drop segment when too few frames survive trim
+
+  const out: MatchedSegment[] = [];
+  for (const seg of segs) {
+    const seq = seg.matchSequence;
+    if (seq.length === 0) continue;
+
+    let lo = 0;
+    while (lo < seq.length && seq[lo].similarity < SIM_CUTOFF) lo++;
+    let hi = seq.length - 1;
+    while (hi > lo && seq[hi].similarity < SIM_CUTOFF) hi--;
+
+    const trimmed = seq.slice(lo, hi + 1);
+    if (trimmed.length < MIN_FRAMES_AFTER) {
+      console.log(
+        `[Matcher] TrimLowSim: seg [${seg.shortStart.toFixed(2)}–${seg.shortEnd.toFixed(2)}s]` +
+        ` dropped (${trimmed.length} frame(s) remain after trim from ${seq.length}).`
+      );
+      continue;
+    }
+
+    const avgConf = trimmed.reduce((s, f) => s + f.similarity, 0) / trimmed.length;
+    out.push({
+      ...seg,
+      matchSequence: trimmed,
+      shortStart:    trimmed[0].shortTime,
+      shortEnd:      trimmed[trimmed.length - 1].shortTime,
+      movieStart:    trimmed[0].movieTime,
+      movieEnd:      trimmed[trimmed.length - 1].movieTime,
+      frameCount:    trimmed.length,
+      confidence:    avgConf,
+    });
+  }
+  return out;
+}
+
+// FIX-3: reject segments where the short-clip advances significantly but the
+// matched movie-time barely moves (walk locked onto a static/smoke frame cluster).
+function frameStagnationFilter(segs: MatchedSegment[]): MatchedSegment[] {
+  const SHORT_ADVANCE_GATE = 1.5;  // s — short-clip window that triggers the check
+  const MOVIE_SPREAD_GATE  = 0.08; // s — movie-time must spread more than this
+
+  return segs.filter(seg => {
+    const seq = seg.matchSequence;
+    if (seq.length < 2) return true;
+
+    for (let i = 0; i < seq.length - 1; i++) {
+      let minMT = seq[i].movieTime, maxMT = seq[i].movieTime;
+      for (let j = i + 1; j < seq.length; j++) {
+        const shortAdvance = seq[j].shortTime - seq[i].shortTime;
+        if (seq[j].movieTime < minMT) minMT = seq[j].movieTime;
+        if (seq[j].movieTime > maxMT) maxMT = seq[j].movieTime;
+        if (shortAdvance >= SHORT_ADVANCE_GATE) {
+          if (maxMT - minMT < MOVIE_SPREAD_GATE) {
+            console.log(
+              `[Matcher] Stagnation-drop: seg [${seg.shortStart.toFixed(2)}–` +
+              `${seg.shortEnd.toFixed(2)}s] movie-time spread=${(maxMT - minMT).toFixed(3)}s` +
+              ` while short advanced ${shortAdvance.toFixed(2)}s — rejected.`
+            );
+            return false;
+          }
+          break;
+        }
+      }
+    }
+    return true;
+  });
+}
+
+// FIX-2: check whether a detected scene-cut boundary falls between two
+// adjacent segments in the short clip.  Prevents merging across hard cuts.
+function hasSceneCutBetween(
+  cur: MatchedSegment,
+  nxt: MatchedSegment,
+  isCut: Uint8Array,
+  shortFps: FPData[]
+): boolean {
+  let curEndSi = -1, nxtStartSi = -1;
+  let curEndDist = Infinity, nxtStartDist = Infinity;
+  for (let si = 0; si < shortFps.length; si++) {
+    const t = shortFps[si].timestamp;
+    const d1 = Math.abs(t - cur.shortEnd);
+    if (d1 < curEndDist)   { curEndDist   = d1; curEndSi   = si; }
+    const d2 = Math.abs(t - nxt.shortStart);
+    if (d2 < nxtStartDist) { nxtStartDist = d2; nxtStartSi = si; }
+  }
+  if (curEndSi < 0 || nxtStartSi <= curEndSi) return false;
+  for (let si = curEndSi + 1; si <= nxtStartSi; si++) {
+    if (isCut[si]) return true;
+  }
+  return false;
+}
+
 /**
  * Merge consecutive segments where:
  *  - The gap in the short clip is small (< SHORT_GAP_MAX seconds)
@@ -1378,7 +1486,11 @@ function sequenceConsistencyFilter(segs: MatchedSegment[]): MatchedSegment[] {
  * Example: seg A ends clip 1.33s/movie 2.83s, seg B starts clip 1.38s/movie
  * 3.42s.  Short gap = 0.05 s, movie gap = 0.59 s.  Merge → single segment.
  */
-function mergeAdjacentSegments(segs: MatchedSegment[]): MatchedSegment[] {
+function mergeAdjacentSegments(
+  segs: MatchedSegment[],
+  isCut?: Uint8Array,    // FIX-2: scene-cut boundaries from detectSceneCuts
+  shortFps?: FPData[]   // FIX-2: short-clip frame timestamps for cut lookup
+): MatchedSegment[] {
   if (segs.length <= 1) return segs;
 
   // Work in short-clip time order
@@ -1400,11 +1512,13 @@ function mergeAdjacentSegments(segs: MatchedSegment[]): MatchedSegment[] {
     //  1. Short gap is small (same scene, brief false-cut boundary)
     //  2. Movie time is moving forward (or very slightly backward — 1 frame jitter)
     //  3. Movie gap is proportional to short gap (same speed ratio, ±4 s tolerance)
+    //  4. FIX-2: no detected scene-cut boundary falls between the two segments
     const mergeable =
       shortGap >= -0.04 &&
       shortGap <= SHORT_GAP_MAX &&
       movieGap >= -0.08 &&                             // not jumping backward in movie
-      movieGap <= shortGap * 5 + 2.5;                 // movie gap roughly proportional
+      movieGap <= shortGap * 5 + 2.5 &&               // movie gap roughly proportional
+      !(isCut && shortFps && hasSceneCutBetween(cur, nxt, isCut, shortFps)); // FIX-2
 
     if (mergeable) {
       const totalFrames = cur.frameCount + nxt.frameCount;
@@ -1777,13 +1891,22 @@ export async function groundMatchedSegments(
   }
 
   // ------------------------------------------------------------------
+  // FIX-4: Hard-trim low-similarity leading/trailing frames before merging
+  // ------------------------------------------------------------------
+  const trimmedSegments = trimLowSimFrames(segments);
+  if (trimmedSegments.length !== segments.length) {
+    console.log(`[Matcher] TrimLowSim: ${segments.length - trimmedSegments.length} segment(s) dropped.`);
+  }
+
+  // ------------------------------------------------------------------
   // Merge adjacent segments that belong to the same continuous run.
   // This repairs over-segmentation from false scene cuts: two segments
   // that should be one get re-joined if their short-clip gap is small
   // and the movie timeline progresses forward proportionally.
+  // FIX-2: pass isCut + shortFps so merges never cross a hard scene cut.
   // ------------------------------------------------------------------
-  const preDedup = mergeAdjacentSegments(segments);
-  console.log(`[Matcher] After merge: ${preDedup.length} segment(s) (was ${segments.length}).`);
+  const preDedup = mergeAdjacentSegments(trimmedSegments, isCut, shortFps);
+  console.log(`[Matcher] After merge: ${preDedup.length} segment(s) (was ${trimmedSegments.length}).`);
 
   // ------------------------------------------------------------------
   // Deduplication — keep highest-confidence segment when short-clip
@@ -1829,8 +1952,14 @@ export async function groundMatchedSegments(
     console.log(`[Matcher] SpeedRatio validation: dropped ${contextValidated.length - speedRatioValidated.length} segment(s).`);
   }
 
+  // FIX-3: reject segments with frame-stagnation (movie time stuck while short advances).
+  const stagnationFiltered = frameStagnationFilter(speedRatioValidated);
+  if (stagnationFiltered.length !== speedRatioValidated.length) {
+    console.log(`[Matcher] Stagnation filter: dropped ${speedRatioValidated.length - stagnationFiltered.length} segment(s).`);
+  }
+
   // Sequence-consistency validation: reject isolated position outliers.
-  const validated = sequenceConsistencyFilter(speedRatioValidated);
+  const validated = sequenceConsistencyFilter(stagnationFiltered);
   if (validated.length !== speedRatioValidated.length) {
     console.log(`[Matcher] Sequence validation: dropped ${speedRatioValidated.length - validated.length} segment(s).`);
   }
@@ -2526,8 +2655,14 @@ async function groundMatchedSegmentsChunked(
   }
 
   // ── 5. Post-process (same as full path) ───────────────────────────────────
-  const merged = mergeAdjacentSegments(segments);
-  console.log(`[MatchChunked] After merge: ${merged.length} segment(s) (was ${segments.length}).`);
+  // FIX-4: hard-trim low-similarity leading/trailing frames before merging
+  const trimmedSegments2 = trimLowSimFrames(segments);
+  if (trimmedSegments2.length !== segments.length) {
+    console.log(`[MatchChunked] TrimLowSim: ${segments.length - trimmedSegments2.length} segment(s) dropped.`);
+  }
+  // FIX-2: pass isCut + shortFps so merges never cross a hard scene cut.
+  const merged = mergeAdjacentSegments(trimmedSegments2, isCut, shortFps);
+  console.log(`[MatchChunked] After merge: ${merged.length} segment(s) (was ${trimmedSegments2.length}).`);
 
   merged.sort((a, b) => b.confidence - a.confidence);
   const deduped: MatchedSegment[] = [];
@@ -2552,8 +2687,14 @@ async function groundMatchedSegmentsChunked(
     console.log(`[MatchChunked] SpeedRatio validation: dropped ${contextValidated2.length - speedRatioValidated2.length} segment(s).`);
   }
 
+  // FIX-3: reject segments with frame-stagnation (movie time stuck while short advances).
+  const stagnationFiltered2 = frameStagnationFilter(speedRatioValidated2);
+  if (stagnationFiltered2.length !== speedRatioValidated2.length) {
+    console.log(`[MatchChunked] Stagnation filter: dropped ${speedRatioValidated2.length - stagnationFiltered2.length} segment(s).`);
+  }
+
   // Sequence-consistency validation: reject isolated position outliers.
-  const validated = sequenceConsistencyFilter(speedRatioValidated2);
+  const validated = sequenceConsistencyFilter(stagnationFiltered2);
   if (validated.length !== speedRatioValidated2.length) {
     console.log(`[MatchChunked] Sequence validation: dropped ${speedRatioValidated2.length - validated.length} segment(s).`);
   }

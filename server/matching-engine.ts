@@ -1048,10 +1048,11 @@ function walkOneDir(
   siMax: number = sSet.fps.length - 1
 ): RawSeq[] {
   const seq: RawSeq[] = [];
-  let lastGoodSi = startSi;
-  let lastGoodMi = startMi;
-  let missCount  = 0;
-  let slope      = 1;
+  let lastGoodSi    = startSi;
+  let lastGoodMi    = startMi;
+  let missCount     = 0;
+  let slope         = 1;
+  let stagnantSteps = 0;
 
   for (
     let nextSi = startSi + direction;
@@ -1126,6 +1127,27 @@ function walkOneDir(
           if (missCount >= GAP_LOOKAHEAD) break;
           continue;
         }
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
+      // ── In-walk stagnation break ──────────────────────────────────────────
+      // If the best movie-frame index hasn't advanced beyond ±1 of the last
+      // accepted position for >2 consecutive steps, the walk has stalled on a
+      // repeated/frozen frame region.  Stop here (don't push) so the segment
+      // ends cleanly before the stagnant tail, rather than accumulating frames
+      // that will cause the entire segment to be rejected by frameStagnationFilter.
+      if (Math.abs(bestMi - lastGoodMi) <= 1) {
+        stagnantSteps++;
+        if (stagnantSteps > 2) {
+          console.log(
+            `[Matcher] Walk stopped early (direction=${direction}) at short=` +
+            `${sSet.fps[nextSi].timestamp.toFixed(2)}s` +
+            ` — movie frame stagnated (bestMi≈${lastGoodMi}) for >2 consecutive steps.`
+          );
+          break;
+        }
+      } else {
+        stagnantSteps = 0;
       }
       // ─────────────────────────────────────────────────────────────────────
 

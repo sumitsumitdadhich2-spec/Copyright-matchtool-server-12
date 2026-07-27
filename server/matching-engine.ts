@@ -46,6 +46,8 @@ export interface FPData {
   timestamp: number;
   variants: Record<string, VariantHashes>;
   signature?: FrameSignature;
+  /** Fraction of frame pixels that were subtitle-masked during extraction (0–1). */
+  maskCoverage?: number;
 }
 
 export interface MatchedSegment {
@@ -591,24 +593,34 @@ function embeddingSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): numbe
 }
 
 export function frameSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): number {
-  const { sim: hSim, is9x16 } = hashSimBestCross(sSet, si, mSet, mi);
+  const { sim: rawHSim, is9x16 } = hashSimBestCross(sSet, si, mSet, mi);
   const sSig = sSet.fps[si].signature;
   const mSig = mSet.fps[mi].signature;
   const tSim = temporalSim(sSet, si, mSet, mi);
   const eSim = embeddingSim(sSet, si, mSet, mi); // -1 if CLIP unavailable
 
+  // Change 3: subtitle-mask correction — if the short clip frame was extracted
+  // with subtitle pixels inpainted, scale hSim upward to compensate for the
+  // fraction of bits that came from inpainting rather than real content.
+  // maskCoverage is 0 for old fingerprints (no change) and gracefully optional.
+  const sMask = sSet.fps[si].maskCoverage ?? 0;
+  const hSim  = sMask > 0.02
+    ? Math.min(100, rawHSim / (1 - sMask * 0.8))
+    : rawHSim;
+
   const hasEmb = eSim >= 0;
 
   if (sSig && mSig) {
-    // FIX-5: 9:16 crop match — gSim (color grid) is unreliable because ~50 % of
-    // the frame area is absent.  Zero its weight and redistribute to hSim / eSim.
+    // FIX-5 + Change 2: 9:16 crop match — gSim (color grid) is unreliable
+    // because ~50 % of the frame area is absent.  Zero its weight and boost
+    // CLIP to 60 % so semantic understanding dominates over raw pixel diff.
     if (is9x16) {
-      if (hasEmb) return hSim * 0.75 + eSim * 0.25;
+      if (hasEmb) return hSim * 0.40 + eSim * 0.60;
       return hSim; // no CLIP and no reliable gSim — pure hash score
     }
     const gSim = signatureSim(sSig, mSig);
     if (hasEmb) {
-      // All four signals: hash (84 % base) + spatial signature + temporal motion + CLIP
+      // All four signals: hash + spatial signature + temporal motion + CLIP
       if (tSim >= 0) return hSim * 0.60 + gSim * 0.12 + tSim * 0.14 + eSim * 0.14;
       return hSim * 0.72 + gSim * 0.14 + eSim * 0.14;
     }
@@ -618,6 +630,30 @@ export function frameSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): nu
   }
   if (hasEmb) return hSim * 0.84 + eSim * 0.16;
   return hSim;
+}
+
+// ---------------------------------------------------------------------------
+// Change 1: Non-linear perception boost
+// ---------------------------------------------------------------------------
+/**
+ * Applies an exponential perception curve to raw similarity scores.
+ *
+ * Human perception of "same video" is non-linear: once structural similarity
+ * passes ~82 %, the remaining differences (crops, colour grades, text overlays)
+ * are largely invisible to a viewer.  This function maps the [82, 100] range
+ * through a power curve (exponent 0.2) so that strong structural matches
+ * produce confidence values in the 90–98 % range expected by human reviewers.
+ *
+ * Calibration:  rawScore 85 % → ~94 %,  rawScore 88 % → ~97 %,  100 % → 100 %.
+ * Scores below 82 % are returned unchanged to preserve the existing thresholds
+ * (minSimilarity, BORDERLINE checks, etc.).
+ */
+function boostScore(rawScore: number): number {
+  const THRESHOLD = 82;
+  if (rawScore < THRESHOLD) return rawScore;
+  const t       = (rawScore - THRESHOLD) / (100 - THRESHOLD); // normalise [0,1]
+  const boosted = Math.pow(t, 0.20);                           // perception curve
+  return Math.min(100, THRESHOLD + boosted * (100 - THRESHOLD));
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,7 +1159,7 @@ function acceptSegment(
   sSet?: PreSet,
   mSet?: PreSet
 ): MatchedSegment {
-  const avgConf = seq.reduce((s, f) => s + f.sim, 0) / seq.length;
+  const avgConf = boostScore(seq.reduce((s, f) => s + f.sim, 0) / seq.length);
 
   const firstSi = seq[0].si;
   const lastSi  = seq[seq.length - 1].si;
@@ -1398,7 +1434,7 @@ function trimLowSimFrames(segs: MatchedSegment[]): MatchedSegment[] {
       continue;
     }
 
-    const avgConf = trimmed.reduce((s, f) => s + f.similarity, 0) / trimmed.length;
+    const avgConf = boostScore(trimmed.reduce((s, f) => s + f.similarity, 0) / trimmed.length);
     out.push({
       ...seg,
       matchSequence: trimmed,

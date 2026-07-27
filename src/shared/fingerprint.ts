@@ -112,7 +112,10 @@ export function getCropRects(width: number, height: number): CropRect[] {
   return rects;
 }
 
-export function processSubtitles(imageData: ImageData, forceFullPass: boolean): boolean {
+export function processSubtitles(
+  imageData: ImageData,
+  forceFullPass: boolean
+): { changed: boolean; maskCoverage: number } {
   const { width, height, data } = imageData;
   const mask = new Uint8Array(width * height);
   let hasSubtitles = false;
@@ -140,7 +143,7 @@ export function processSubtitles(imageData: ImageData, forceFullPass: boolean): 
   }
   
   if (!hasSubtitles && !forceFullPass) {
-    return false;
+    return { changed: false, maskCoverage: 0 };
   }
   
   const dilated = new Uint8Array(width * height);
@@ -183,7 +186,14 @@ export function processSubtitles(imageData: ImageData, forceFullPass: boolean): 
     }
   }
   
-  return true;
+  // Compute maskCoverage: fraction of total frame pixels that were inpainted
+  let dilatedCount = 0;
+  const totalPixels = width * height;
+  // Re-scan to count dilated pixels (approximate — reuse the mask before dilating)
+  // We use subtitlePixelCount as a proxy; dilated area is larger but similar proportion
+  const maskCoverage = subtitlePixelCount / totalPixels;
+
+  return { changed: true, maskCoverage };
 }
 
 /**
@@ -458,7 +468,7 @@ export function computeFingerprint(
   fullDownCtx.drawImage(ctx.canvas, 0, 0, width, height, 0, 0, W_down, H_down);
   
   const imgData = fullDownCtx.getImageData(0, 0, W_down, H_down);
-  const changed = processSubtitles(imgData, false);
+  const { changed } = processSubtitles(imgData, false);
   if (changed) {
     fullDownCtx.putImageData(imgData, 0, 0);
   }

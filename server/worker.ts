@@ -63,7 +63,7 @@ parentPort?.on('message', async (message) => {
     fullDownCtx.drawImage(canvas, 0, 0, width, height, 0, 0, W_down, H_down);
     
     const imgDataDown = fullDownCtx.getImageData(0, 0, W_down, H_down);
-    const changed = processSubtitles(imgDataDown as any, false);
+    const { changed, maskCoverage } = processSubtitles(imgDataDown as any, false);
     if (changed) {
       fullDownCtx.putImageData(imgDataDown, 0, 0);
     }
@@ -153,7 +153,7 @@ parentPort?.on('message', async (message) => {
     
     parentPort?.postMessage({
       id,
-      result: { variants, signature, embedding, clipInferMs, clipError },
+      result: { variants, signature, embedding, clipInferMs, clipError, maskCoverage: changed ? maskCoverage : 0 },
     });
   } catch (error: any) {
     parentPort?.postMessage({ id, error: error.message || String(error) });

@@ -86,8 +86,8 @@ async function runMilestone1Tests() {
     // Run forced full pass (dilate + inpaint on empty mask)
     const changed2 = processSubtitles(frameClone2 as any, true);
 
-    if (changed1 !== false || changed2 !== true) {
-       console.error("  Mismatch in return values. changed1:", changed1, "changed2:", changed2);
+    if (changed1.changed !== false || changed2.changed !== true) {
+       console.error("  Mismatch in return values. changed1:", changed1.changed, "changed2:", changed2.changed);
     }
 
     // Byte-by-byte comparison

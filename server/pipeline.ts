@@ -97,6 +97,7 @@ export interface FingerprintResult {
   timestamp: number;
   variants: Record<string, { hash: string }>;
   signature?: FrameSignature;
+  maskCoverage?: number;
 }
 
 /**
@@ -132,6 +133,7 @@ export function extractFingerprints(
       embedding?: number[];
       clipInferMs?: number;
       clipError?: string;
+      maskCoverage?: number;
     }>();
     const taskQueue: { id: number; frameBuffer: Buffer; width: number; height: number; frameIndex: number }[] = [];
 
@@ -222,7 +224,8 @@ export function extractFingerprints(
               frameIndex: i,
               timestamp: (i - 1) / FRAME_RATE,
               variants: fp.variants,
-              signature: fp.signature
+              signature: fp.signature,
+              ...(fp.maskCoverage ? { maskCoverage: fp.maskCoverage } : {}),
             }) + '\n';
           writeStream.write(line);
           fingerprints.delete(i); // free memory
@@ -402,6 +405,7 @@ export function extractFingerprints(
             embedding?: number[];
             clipInferMs?: number;
             clipError?: string;
+            maskCoverage?: number;
           }>((res, rej) => {
             activeTasks.set(id, { resolve: res, reject: rej });
           });

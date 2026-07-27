@@ -3065,7 +3065,8 @@ import { promisify } from 'util';
 import * as path from 'path';
 import { getObjectSignal, compareObjectSignals, initObjectSignal } from './object-signal';
 import { getFaceSignal, compareFaceSignals, initFaceSignal } from './face-signal';
-import { getKeypointSignal, compareKeypointSignals, initKeypointSignal } from './keypoint-signal';
+import { getKeypointSignal, compareKeypointSignals, matchKeypointsWithCorrespondences, initKeypointSignal } from './keypoint-signal';
+import { computeHomographyAlignment, ALIGNED_SIM_THRESHOLD, MIN_MATCHES_FOR_ALIGNMENT } from './homography-align';
 import { getSubjectMask, compareSubjectSignals, initSubjectSignal } from './subject-signal';
 import { createCanvas, loadImage } from 'canvas';
 
@@ -3203,7 +3204,10 @@ async function enhanceBorderlineSegments(result: MatchResult, shortResultPath: s
       const kpT0 = Date.now();
       const shortKp = getKeypointSignal(shortImageData);
       const movieKp = getKeypointSignal(movieImageData);
-      const kpMatch = compareKeypointSignals(shortKp, movieKp);
+
+      // Use matchKeypointsWithCorrespondences instead of compareKeypointSignals so we
+      // get the coordinate pairs needed for homography alignment — identical Hamming cost.
+      const kpMatch = matchKeypointsWithCorrespondences(shortKp, movieKp);
       const kpMs    = Date.now() - kpT0;
 
       console.log(
@@ -3216,6 +3220,7 @@ async function enhanceBorderlineSegments(result: MatchResult, shortResultPath: s
       if (kpMatch.keypointSim > KEYPOINT_SIM_THRESHOLD) {
         const boost = Math.max(82 - seg.confidence + 1, 0);
         seg.confidence += boost;
+        boosted = true;
         console.log(
           `[KeypointSignal] Borderline match at frame ${frameMatch.shortTime.toFixed(2)}s` +
           ` confirmed by ORB keypoint matching` +
@@ -3223,6 +3228,55 @@ async function enhanceBorderlineSegments(result: MatchResult, shortResultPath: s
           ` keypointSim=${kpMatch.keypointSim.toFixed(1)}%).` +
           ` Boosted confidence to ${seg.confidence.toFixed(1)}%.`
         );
+      }
+
+      // ── Homography-based pre-alignment ──────────────────────────────────────
+      //
+      // Runs when the standard keypointSim didn't confirm the match but there are
+      // enough correspondences to estimate a reliable geometric transform.
+      //
+      // Typical scenario: the short clip was cropped or rotated in a way that
+      // doesn't align with any of the 13 preset crop/zoom variants, so the hash
+      // comparison was made on misaligned images.  Aligning geometrically and
+      // recomputing similarity on the corrected images is not score manipulation —
+      // it's correcting the comparison.  Logs say "corrected" / "refined", not
+      // "boosted".
+      //
+      if (!boosted && kpMatch.goodMatches >= MIN_MATCHES_FOR_ALIGNMENT) {
+        const alignT0 = Date.now();
+        const alignResult = computeHomographyAlignment(
+          shortImageData, movieImageData, kpMatch.correspondences,
+        );
+        const alignMs = Date.now() - alignT0;
+
+        if (alignResult.aligned) {
+          const improvement = alignResult.alignedHashSim - alignResult.priorSim;
+          console.log(
+            `[Homography] Borderline segment at short ${frameMatch.shortTime.toFixed(2)}s` +
+            ` / movie ${frameMatch.movieTime.toFixed(2)}s —` +
+            ` rotation=${alignResult.rotation.toFixed(1)}°, scale=${alignResult.scale.toFixed(3)},` +
+            ` inliers=${alignResult.inlierCount}/${alignResult.goodMatchCount}` +
+            ` — refined hash similarity corrected from` +
+            ` ${alignResult.priorSim.toFixed(1)}% to ${alignResult.alignedHashSim.toFixed(1)}%` +
+            ` (${improvement >= 0 ? '+' : ''}${improvement.toFixed(1)}pp, ${alignMs} ms)`
+          );
+
+          if (alignResult.alignedHashSim > ALIGNED_SIM_THRESHOLD) {
+            const boost = Math.max(82 - seg.confidence + 1, 0);
+            seg.confidence += boost;
+            boosted = true;
+            console.log(
+              `[Homography] Borderline segment at ${frameMatch.shortTime.toFixed(2)}s confirmed` +
+              ` by post-alignment hash comparison (alignedHashSim=${alignResult.alignedHashSim.toFixed(1)}%).` +
+              ` Geometric mismatch corrected — confidence refined to ${seg.confidence.toFixed(1)}%.`
+            );
+          }
+        } else {
+          console.log(
+            `[Homography] Skipped — insufficient inliers for reliable affine model` +
+            ` (${kpMatch.goodMatches} good matches, need ≥ ${MIN_MATCHES_FOR_ALIGNMENT}).`
+          );
+        }
       }
     }
 

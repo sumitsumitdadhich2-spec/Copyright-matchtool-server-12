@@ -104,6 +104,20 @@ export interface KeypointMatchResult {
   keypointSim: number;  // 0–100
 }
 
+/**
+ * Pixel-space coordinate pair for one matched keypoint, in the 128×72
+ * downscaled analysis grid that getKeypointSignal() operates in.
+ */
+export interface KeypointCorrespondence {
+  ax: number; ay: number;  // keypoint in frame A (short clip)
+  bx: number; by: number;  // keypoint in frame B (movie)
+}
+
+export interface KeypointMatchResultWithCorrespondences extends KeypointMatchResult {
+  /** Coordinate pairs for all good matches — used by homography-align.ts. */
+  correspondences: KeypointCorrespondence[];
+}
+
 // ---------------------------------------------------------------------------
 // init — pure-TS implementation has no async startup cost; exported for
 //        API symmetry with the other signal modules.
@@ -364,4 +378,52 @@ export function compareKeypointSignals(
 
   const keypointSim = Math.min(100, (goodMatches / Math.min(nA, nB)) * SIM_SCALE);
   return { goodMatches, totalA: nA, totalB: nB, keypointSim };
+}
+
+/**
+ * Same as compareKeypointSignals but also returns the matched coordinate pairs
+ * in the 128×72 analysis grid.  The correspondences are consumed by
+ * homography-align.ts to compute a geometric pre-alignment for borderline segments.
+ *
+ * Cost: identical to compareKeypointSignals (same O(nA × nB) Hamming loop) —
+ * no extra work beyond recording the matched indices.
+ */
+export function matchKeypointsWithCorrespondences(
+  a: KeypointSignalResult,
+  b: KeypointSignalResult,
+): KeypointMatchResultWithCorrespondences {
+  const nA = a.count;
+  const nB = b.count;
+
+  if (!a.hasKeypoints || !b.hasKeypoints || nA === 0 || nB === 0) {
+    return { goodMatches: 0, totalA: nA, totalB: nB, keypointSim: 0, correspondences: [] };
+  }
+
+  let goodMatches = 0;
+  const correspondences: KeypointCorrespondence[] = [];
+
+  for (let i = 0; i < nA; i++) {
+    const aOff = i * DESCRIPTOR_BYTES;
+    let d1 = Infinity, d2 = Infinity;
+    let bestJ = -1;
+
+    for (let j = 0; j < nB; j++) {
+      const d = hamming(a.descriptors, aOff, b.descriptors, j * DESCRIPTOR_BYTES);
+      if (d < d1) { d2 = d1; d1 = d; bestJ = j; }
+      else if (d < d2) { d2 = d; }
+    }
+
+    if (d2 > 0 && d1 / d2 < RATIO_THRESHOLD && bestJ >= 0) {
+      goodMatches++;
+      correspondences.push({
+        ax: a.keypoints[i].x,
+        ay: a.keypoints[i].y,
+        bx: b.keypoints[bestJ].x,
+        by: b.keypoints[bestJ].y,
+      });
+    }
+  }
+
+  const keypointSim = Math.min(100, (goodMatches / Math.min(nA, nB)) * SIM_SCALE);
+  return { goodMatches, totalA: nA, totalB: nB, keypointSim, correspondences };
 }

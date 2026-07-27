@@ -77,6 +77,18 @@ export interface MatchedSegment {
   }>;
   /** Per-channel similarity breakdown for the best-matching frame in this segment */
   bestFrameDetail?: FrameDetail;
+  /**
+   * Statistical probability (0–100%) that this segment is a genuine match and
+   * NOT a coincidental alignment.  Computed separately from `confidence` — see
+   * computeMatchProbability() and MATCH_PROBABILITY_FORMULA.md for the full
+   * audit trail.  This field is ALWAYS additive and NEVER modifies `confidence`.
+   */
+  matchProbability?: number;
+  /**
+   * Human-readable description of the basis for matchProbability, e.g.
+   * "150 consecutive frames sustained at ~85.3% similarity".
+   */
+  matchProbabilityBasis?: string;
 }
 
 export interface MatchResult {
@@ -94,6 +106,88 @@ export interface MatchProgressInfo {
   shortStart?: number;    // timestamp (s) of chunk start in the short clip
   shortEnd?: number;      // timestamp (s) of chunk end in the short clip
   segmentsFound?: number; // confirmed matched segments found so far
+}
+
+// ---------------------------------------------------------------------------
+// Statistical Match Probability
+// ---------------------------------------------------------------------------
+//
+// ## Formula (see MATCH_PROBABILITY_FORMULA.md for full audit trail)
+//
+// We treat each frame in the matched run as an independent trial.
+// The baseline chance that a completely random, unrelated frame pair achieves
+// similarity ≥ S is modelled as (BASELINE / S), where BASELINE = 50 is the
+// expected Hamming similarity of random perceptual-hash bit strings (~50 %).
+//
+//   P(one random frame matches at level S by chance) = BASELINE / S
+//
+// For a run of N consecutive frames all matching at average raw similarity S̄:
+//   P(entire run is coincidental) = (BASELINE / S̄)^N
+//
+//   matchProbability = 1 − (BASELINE / S̄)^N          [clamped to 0–100 %]
+//
+// Key properties:
+//   • N=1,  S̄=85 % → matchProbability ≈ 41 %   (limited evidence from one frame)
+//   • N=10, S̄=85 % → matchProbability ≈ 99.9 % (very likely genuine)
+//   • N=150,S̄=85 % → matchProbability ≈ 100 %  (conclusive)
+//
+// One-sentence explanation for non-technical audiences:
+//   "The probability that this many consecutive frames would all look this
+//    similar by pure chance, rather than because the clip genuinely comes from
+//    the reference video."
+//
+// IMPORTANT: this function NEVER reads or modifies `segment.confidence`.
+// It is a completely independent computation added as a new, separate field.
+//
+function computeMatchProbability(seg: MatchedSegment): {
+  matchProbability: number;
+  matchProbabilityBasis: string;
+} {
+  const BASELINE = 50; // Expected random perceptual-hash similarity (%)
+
+  const N = seg.matchSequence.length;
+  if (N === 0) {
+    return { matchProbability: 0, matchProbabilityBasis: '0 frames — no data' };
+  }
+
+  // Use raw (un-boosted) per-frame similarity values from matchSequence.
+  // These are always in [0, 100]; trimLowSimFrames guarantees each ≥ 75.
+  const avgRawSim = seg.matchSequence.reduce((s, f) => s + f.similarity, 0) / N;
+
+  if (avgRawSim <= BASELINE) {
+    // Degenerate — at or below random baseline; shouldn't occur after trimLowSimFrames
+    return {
+      matchProbability: 0,
+      matchProbabilityBasis:
+        `${N} frame${N === 1 ? '' : 's'} at ~${avgRawSim.toFixed(1)}% similarity — at or below random baseline`,
+    };
+  }
+
+  // Log-space arithmetic to avoid floating-point underflow for large N
+  const logPCoincidence = N * Math.log(BASELINE / avgRawSim);
+  const pCoincidence    = Math.exp(logPCoincidence);
+  const matchProbability = Math.min(100, Math.max(0, (1 - pCoincidence) * 100));
+
+  const frameLabel = `${N} consecutive frame${N === 1 ? '' : 's'}`;
+  const simLabel   = `~${avgRawSim.toFixed(1)}% similarity`;
+  const oddsLabel  = pCoincidence < 1e-6
+    ? ` (1 in ${(1 / pCoincidence).toExponential(1)} chance of coincidence)`
+    : pCoincidence < 0.01
+    ? ` (${(pCoincidence * 100).toFixed(3)}% coincidence chance)`
+    : '';
+
+  return {
+    matchProbability,
+    matchProbabilityBasis: `${frameLabel} sustained at ${simLabel}${oddsLabel}`,
+  };
+}
+
+/** Apply computeMatchProbability to every segment in an array (additive — never touches confidence). */
+function addMatchProbability(segs: MatchedSegment[]): MatchedSegment[] {
+  return segs.map(seg => {
+    const { matchProbability, matchProbabilityBasis } = computeMatchProbability(seg);
+    return { ...seg, matchProbability, matchProbabilityBasis };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2013,8 +2107,11 @@ export async function groundMatchedSegments(
 
   const unmatchedRanges = computeUnmatched(shortFps, usedFinal);
 
-  console.log(`[Matcher] Final: ${validated.length} segment(s), ${unmatchedRanges.length} unmatched range(s).`);
-  return { segments: validated, unmatchedRanges };
+  // Attach matchProbability to every finalized segment (additive — never touches confidence).
+  const withProbability = addMatchProbability(validated);
+
+  console.log(`[Matcher] Final: ${withProbability.length} segment(s), ${unmatchedRanges.length} unmatched range(s).`);
+  return { segments: withProbability, unmatchedRanges };
 }
 
 // ---------------------------------------------------------------------------
@@ -2745,8 +2842,11 @@ async function groundMatchedSegmentsChunked(
     }
   }
 
-  console.log(`[MatchChunked] Final: ${validated.length} segment(s).`);
-  return { segments: validated, unmatchedRanges: computeUnmatched(shortFps, usedFinal) };
+  // Attach matchProbability to every finalized segment (additive — never touches confidence).
+  const withProbability = addMatchProbability(validated);
+
+  console.log(`[MatchChunked] Final: ${withProbability.length} segment(s).`);
+  return { segments: withProbability, unmatchedRanges: computeUnmatched(shortFps, usedFinal) };
 }
 
 // ---------------------------------------------------------------------------

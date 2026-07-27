@@ -43,6 +43,13 @@ interface MatchedSegment {
   speedRatio?: number;
   matchSequence: Array<{ shortTime: number; movieTime: number; similarity: number }>;
   bestFrameDetail?: FrameDetail;
+  /**
+   * Statistical probability (0–100%) that the segment is a genuine match and NOT coincidental.
+   * Separate from and additive to `confidence` — see MATCH_PROBABILITY_FORMULA.md.
+   */
+  matchProbability?: number;
+  /** Human-readable basis for matchProbability, e.g. "150 consecutive frames at ~85.3% similarity". */
+  matchProbabilityBasis?: string;
 }
 
 interface UnmatchedRange {
@@ -1467,7 +1474,8 @@ export default function App() {
                     <th className="px-4 py-3 text-left">Movie Time</th>
                     <th className="px-4 py-3 text-left">Duration</th>
                     <th className="px-4 py-3 text-left">Frames</th>
-                    <th className="px-4 py-3 text-left">Confidence</th>
+                    <th className="px-4 py-3 text-left">Frame Similarity</th>
+                    <th className="px-4 py-3 text-left">Match Probability</th>
                     <th className="px-4 py-3 text-right">Compare</th>
                   </tr>
                 </thead>
@@ -1533,9 +1541,40 @@ export default function App() {
                           )}
                         </td>
 
-                        {/* Confidence */}
+                        {/* Frame Similarity (confidence — unchanged, as-computed value) */}
                         <td className="px-4 py-3">
                           <ConfidenceBadge confidence={seg.confidence} isApproximate={seg.isApproximate} />
+                        </td>
+
+                        {/* Match Probability — separate statistical field, never replaces confidence */}
+                        <td className="px-4 py-3">
+                          {seg.matchProbability != null ? (
+                            <div
+                              title={seg.matchProbabilityBasis ?? ''}
+                              className="cursor-help"
+                            >
+                              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-xs font-semibold border ${
+                                seg.matchProbability >= 99
+                                  ? 'bg-indigo-500/10 text-indigo-300 border-indigo-500/25'
+                                  : seg.matchProbability >= 85
+                                  ? 'bg-violet-500/10 text-violet-300 border-violet-500/25'
+                                  : seg.matchProbability >= 60
+                                  ? 'bg-slate-500/10 text-slate-400 border-slate-500/25'
+                                  : 'bg-slate-700/10 text-slate-500 border-slate-600/25'
+                              }`}>
+                                {seg.matchProbability >= 99.9
+                                  ? '≥ 99.9%'
+                                  : `${seg.matchProbability.toFixed(1)}%`}
+                              </span>
+                              {seg.matchProbabilityBasis && (
+                                <div className="mt-0.5 text-[10px] text-slate-500 max-w-[160px] leading-tight">
+                                  {seg.matchProbabilityBasis}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-slate-600 text-xs">—</span>
+                          )}
                         </td>
 
                         {/* Compare button */}

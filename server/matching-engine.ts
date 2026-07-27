@@ -61,6 +61,14 @@ export interface MatchedSegment {
   /** Short-clip frames skipped due to low confidence within this segment */
   gapCount: number;
   /**
+   * True when this segment was produced by the post-validation Gap Recovery
+   * Pass.  The globally best-available movie match was used regardless of
+   * confidence, so the segment may have lower similarity than normal segments.
+   * It guarantees that every part of the short clip maps to *some* movie
+   * region — even altered/unmatched content gets a best-effort placement.
+   */
+  isGapFill?: boolean;
+  /**
    * Effective speed ratio of the short clip relative to the reference movie.
    * Computed via linear regression over the full match sequence.
    *   1.0  = normal speed
@@ -2150,12 +2158,128 @@ export async function groundMatchedSegments(
     }
   }
 
-  const unmatchedRanges = computeUnmatched(shortFps, usedFinal);
+  // ── Gap Recovery Pass ──────────────────────────────────────────────────────
+  // After all validation filters some short-clip sections remain uncovered.
+  // For each significant uncovered range we run a forced global best-match scan
+  // with NO confidence gate so that every part of the short clip produces at
+  // least one segment. Segments found here are marked isGapFill=true so the UI
+  // can display them distinctly from high-confidence matches.
+  //
+  // Strategy (mirrors the user's intent):
+  //   1. Already-validated segments are kept as-is (high quality).
+  //   2. For every gap >= MIN_GAP_RECOVERY_FRAMES, scan all movie frames and
+  //      pick the single globally-best match for each gap frame.
+  //   3. Group consecutive gap frames whose best-match movie positions advance
+  //      monotonically into sub-segments.
+  //   4. Always emit a segment — even weak matches — so nothing is skipped.
+  // ---------------------------------------------------------------------------
+  const MIN_GAP_RECOVERY_FRAMES = 5; // < 5 frames ≈ 0.2 s — too small to be useful
+  const gapFillSegs: MatchedSegment[] = [];
+
+  {
+    // Collect uncovered frame-index ranges from usedFinal
+    const gapRanges: Array<{ start: number; end: number }> = [];
+    let gStart = -1;
+    for (let i = 0; i <= shortFps.length; i++) {
+      const free = i < shortFps.length && !usedFinal[i];
+      if (free) {
+        if (gStart < 0) gStart = i;
+      } else if (gStart >= 0) {
+        gapRanges.push({ start: gStart, end: i - 1 });
+        gStart = -1;
+      }
+    }
+
+    for (const gap of gapRanges) {
+      const gapSize = gap.end - gap.start + 1;
+      if (gapSize < MIN_GAP_RECOVERY_FRAMES) {
+        // Too small — leave as unmatched
+        continue;
+      }
+
+      console.log(
+        `[Matcher] GapFill: recovering ${gapSize} frame(s)` +
+        ` [${shortFps[gap.start].timestamp.toFixed(2)}–` +
+        `${shortFps[gap.end].timestamp.toFixed(2)}s]…`
+      );
+
+      // Global best-match scan: for each gap frame find the best movie frame
+      const bestOf: Array<{ si: number; mi: number; sim: number }> = [];
+      for (let idx = 0; idx < gapSize; idx++) {
+        const si = gap.start + idx;
+
+        const yp = yieldIfNeeded(idx, 200);
+        if (yp) await yp;
+
+        let bestMi = 0, bestSim = 0;
+        for (let mi = 0; mi < movieFps.length; mi++) {
+          const s = frameSim(sSet, si, mSet, mi);
+          if (s > bestSim) { bestSim = s; bestMi = mi; }
+        }
+        bestOf.push({ si, mi: bestMi, sim: bestSim });
+      }
+
+      // Group temporally-contiguous frames into sub-segments
+      let k = 0;
+      while (k < bestOf.length) {
+        const group: typeof bestOf = [bestOf[k]];
+        let curMi = bestOf[k].mi;
+
+        for (let j = k + 1; j < bestOf.length; j++) {
+          const item     = bestOf[j];
+          const siGap    = item.si - bestOf[j - 1].si;
+          const expected = curMi + siGap;
+          if (Math.abs(item.mi - expected) <= LOOK_AHEAD * 2) {
+            group.push(item);
+            curMi = item.mi;
+          } else {
+            break;
+          }
+        }
+
+        const seg: MatchedSegment = {
+          ...acceptSegment(group, shortFps, movieFps, true, sSet, mSet),
+          isGapFill: true,
+        };
+        gapFillSegs.push(seg);
+        console.log(
+          `[Matcher] GapFill: seg [${seg.shortStart.toFixed(2)}–${seg.shortEnd.toFixed(2)}s]` +
+          ` → movie [${seg.movieStart.toFixed(2)}–${seg.movieEnd.toFixed(2)}s]` +
+          ` conf=${seg.confidence.toFixed(1)}%`
+        );
+        k += Math.max(1, group.length);
+      }
+    }
+
+    if (gapFillSegs.length > 0) {
+      console.log(`[Matcher] GapFill: ${gapFillSegs.length} recovery segment(s) added.`);
+    }
+  }
+
+  // Merge validated (high-quality) + gap-fill (recovered) segments,
+  // sorted by short-clip position so the output always follows the short video.
+  const allFinal = [...validated, ...gapFillSegs];
+  allFinal.sort((a, b) => a.shortStart - b.shortStart);
+
+  // Re-compute coverage including gap-fill frames for accurate unmatchedRanges
+  const usedFinalAll = new Uint8Array(shortFps.length);
+  for (const seg of allFinal) {
+    for (const frame of seg.matchSequence) {
+      const si = tToSi.get(frame.shortTime.toFixed(4));
+      if (si !== undefined) usedFinalAll[si] = 1;
+    }
+  }
+
+  const unmatchedRanges = computeUnmatched(shortFps, usedFinalAll);
 
   // Attach matchProbability to every finalized segment (additive — never touches confidence).
-  const withProbability = addMatchProbability(validated);
+  const withProbability = addMatchProbability(allFinal);
 
-  console.log(`[Matcher] Final: ${withProbability.length} segment(s), ${unmatchedRanges.length} unmatched range(s).`);
+  console.log(
+    `[Matcher] Final: ${withProbability.length} segment(s)` +
+    (gapFillSegs.length > 0 ? ` (${validated.length} validated + ${gapFillSegs.length} gap-fill)` : '') +
+    `, ${unmatchedRanges.length} unmatched range(s).`
+  );
   return { segments: withProbability, unmatchedRanges };
 }
 
@@ -2887,11 +3011,150 @@ async function groundMatchedSegmentsChunked(
     }
   }
 
-  // Attach matchProbability to every finalized segment (additive — never touches confidence).
-  const withProbability = addMatchProbability(validated);
+  // ── Gap Recovery Pass (Chunked) ────────────────────────────────────────────
+  // After all validation filters, some short-clip sections may be uncovered.
+  // For each significant gap:
+  //   1. Find the highest-scoring allCands entry for any seed inside the gap
+  //      (this is the best known movie anchor for this portion of the clip).
+  //   2. Load a bounded walk window (± WALK_WINDOW) around that anchor — the
+  //      same window size used in Passes 1 & 2 above.
+  //   3. Scan EVERY gap frame (si) against EVERY frame in the window to find
+  //      its per-frame best match.  This produces frame-dense coverage — not
+  //      just the 5 strategic seed positions.
+  //   4. Group temporally-contiguous (si, mi) pairs into sub-segments and emit
+  //      them with isGapFill=true.  No confidence gate — always emit.
+  //
+  // Cost: O(gapFrames × 2×WALK_WINDOW) per gap, not O(gapFrames × fullMovie).
+  // ---------------------------------------------------------------------------
+  const MIN_GAP_RECOVERY_FRAMES_C = 5;
+  const gapFillSegs: MatchedSegment[] = [];
 
-  console.log(`[MatchChunked] Final: ${withProbability.length} segment(s).`);
-  return { segments: withProbability, unmatchedRanges: computeUnmatched(shortFps, usedFinal) };
+  {
+    // Find uncovered frame-index ranges from usedFinal
+    const gapRanges: Array<{ start: number; end: number }> = [];
+    let gStart = -1;
+    for (let i = 0; i <= shortFps.length; i++) {
+      const free = i < shortFps.length && !usedFinal[i];
+      if (free) {
+        if (gStart < 0) gStart = i;
+      } else if (gStart >= 0) {
+        gapRanges.push({ start: gStart, end: i - 1 });
+        gStart = -1;
+      }
+    }
+
+    for (const gap of gapRanges) {
+      const gapFrameCount = gap.end - gap.start + 1;
+      if (gapFrameCount < MIN_GAP_RECOVERY_FRAMES_C) continue;
+
+      console.log(
+        `[MatchChunked] GapFill: recovering ${gapFrameCount} frame(s)` +
+        ` [${shortFps[gap.start].timestamp.toFixed(2)}–` +
+        `${shortFps[gap.end].timestamp.toFixed(2)}s]…`
+      );
+
+      // ── Step 1: Find best movie anchor via allCands seeds in this gap ──────
+      // allCands has entries only for the 5 strategic seed positions per chunk;
+      // use the highest-similarity one as the window anchor.
+      let bestAnchorMi  = -1;
+      let bestAnchorSim = 0;
+      for (const [si, cands] of allCands) {
+        if (si >= gap.start && si <= gap.end && cands.length > 0) {
+          if (cands[0].sim > bestAnchorSim) {
+            bestAnchorSim = cands[0].sim;
+            bestAnchorMi  = cands[0].mi;
+          }
+        }
+      }
+
+      if (bestAnchorMi < 0) {
+        console.log(`[MatchChunked] GapFill: no seed candidates in gap — skipping.`);
+        continue;
+      }
+
+      // ── Step 2: Load bounded walk window around the anchor ─────────────────
+      const winStart = Math.max(0, bestAnchorMi - WALK_WINDOW);
+      const winEnd   = Math.min(totalMovieFrames - 1, bestAnchorMi + WALK_WINDOW);
+      const winSet   = await loadMovieWindowPreset(
+        movieFilePath, byteOffsets, winStart, winEnd, meta
+      );
+      const winLen   = winEnd - winStart + 1;
+
+      // ── Step 3: Per-frame best-match scan within the window ─────────────────
+      // For every gap frame si, find the best matching local frame inside the
+      // loaded window — produces a dense (si, globalMi, sim) array.
+      const bestOf: Array<{ si: number; mi: number; sim: number }> = [];
+      for (let si = gap.start; si <= gap.end; si++) {
+        let bestLocalMi  = 0;
+        let bestLocalSim = 0;
+        for (let localMi = 0; localMi < winLen; localMi++) {
+          const s = hashSimFastCross(shortSet, si, winSet, localMi);
+          if (s > bestLocalSim) { bestLocalSim = s; bestLocalMi = localMi; }
+        }
+        bestOf.push({ si, mi: winStart + bestLocalMi, sim: bestLocalSim });
+      }
+
+      // ── Step 4: Group temporally-contiguous frames into sub-segments ────────
+      let k = 0;
+      while (k < bestOf.length) {
+        const group: typeof bestOf = [bestOf[k]];
+        let curMi   = bestOf[k].mi;
+
+        for (let j = k + 1; j < bestOf.length; j++) {
+          const item     = bestOf[j];
+          const siGap    = item.si - bestOf[j - 1].si;
+          const expected = curMi + siGap;
+          if (Math.abs(item.mi - expected) <= LOOK_AHEAD * 2) {
+            group.push(item);
+            curMi = item.mi;
+          } else {
+            break;
+          }
+        }
+
+        const seg: MatchedSegment = {
+          ...acceptSegment(group, shortFps, movieMetaFps, true),
+          isGapFill: true,
+        };
+        gapFillSegs.push(seg);
+        console.log(
+          `[MatchChunked] GapFill: seg [${seg.shortStart.toFixed(2)}–${seg.shortEnd.toFixed(2)}s]` +
+          ` → movie [${seg.movieStart.toFixed(2)}–${seg.movieEnd.toFixed(2)}s]` +
+          ` conf=${seg.confidence.toFixed(1)}%`
+        );
+        k += Math.max(1, group.length);
+      }
+    }
+
+    if (gapFillSegs.length > 0) {
+      console.log(`[MatchChunked] GapFill: ${gapFillSegs.length} recovery segment(s) added.`);
+    }
+  }
+
+  // Combine validated (high-quality) + gap-fill (recovered), sort by short-clip position
+  const allFinalC = [...validated, ...gapFillSegs];
+  allFinalC.sort((a, b) => a.shortStart - b.shortStart);
+
+  // Re-compute coverage including gap-fill frames for accurate unmatchedRanges
+  const usedFinalAll = new Uint8Array(shortFps.length);
+  for (const seg of allFinalC) {
+    for (const frame of seg.matchSequence) {
+      const si = tToSi.get(frame.shortTime.toFixed(4));
+      if (si !== undefined) usedFinalAll[si] = 1;
+    }
+  }
+
+  // Attach matchProbability to every finalized segment (additive — never touches confidence).
+  const withProbability = addMatchProbability(allFinalC);
+
+  console.log(
+    `[MatchChunked] Final: ${withProbability.length} segment(s)` +
+    (gapFillSegs.length > 0
+      ? ` (${validated.length} validated + ${gapFillSegs.length} gap-fill)`
+      : '') +
+    `.`
+  );
+  return { segments: withProbability, unmatchedRanges: computeUnmatched(shortFps, usedFinalAll) };
 }
 
 // ---------------------------------------------------------------------------

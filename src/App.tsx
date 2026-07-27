@@ -50,6 +50,12 @@ interface MatchedSegment {
   matchProbability?: number;
   /** Human-readable basis for matchProbability, e.g. "150 consecutive frames at ~85.3% similarity". */
   matchProbabilityBasis?: string;
+  /**
+   * True when this segment was recovered by the post-validation Gap Recovery Pass.
+   * Best-available movie match was used regardless of confidence to ensure full
+   * short-clip coverage. May have lower similarity than normal segments.
+   */
+  isGapFill?: boolean;
 }
 
 interface UnmatchedRange {
@@ -1429,13 +1435,13 @@ export default function App() {
                         : `${unmatchedRanges.length} unmatched range${unmatchedRanges.length !== 1 ? 's' : ''}`}
                     </span>
                   </div>
-                  {/* Stacked bar: green=matched, orange=unmatched */}
+                  {/* Stacked bar: green=matched, violet=gap-fill recovered, orange=unmatched */}
                   <div className="relative h-6 rounded overflow-hidden bg-slate-800 flex">
                     {(() => {
                       // Build a sorted list of intervals with type
-                      type Bar = { start: number; end: number; kind: 'match' | 'gap'; conf: number; idx: number };
+                      type Bar = { start: number; end: number; kind: 'match' | 'gapfill' | 'gap'; conf: number; idx: number };
                       const bars: Bar[] = [];
-                      segments.forEach((s, i) => bars.push({ start: s.shortStart, end: s.shortEnd, kind: 'match', conf: s.confidence, idx: i }));
+                      segments.forEach((s, i) => bars.push({ start: s.shortStart, end: s.shortEnd, kind: s.isGapFill ? 'gapfill' : 'match', conf: s.confidence, idx: i }));
                       unmatchedRanges.forEach((u, i) => bars.push({ start: u.shortStart, end: u.shortEnd, kind: 'gap', conf: 0, idx: i }));
                       bars.sort((a, b) => a.start - b.start);
                       return bars.map((bar, i) => {
@@ -1444,8 +1450,12 @@ export default function App() {
                         const conf  = bar.conf;
                         const bg    = bar.kind === 'gap'
                           ? 'bg-orange-700/60'
+                          : bar.kind === 'gapfill'
+                          ? 'bg-violet-500/70'
                           : conf >= 80 ? 'bg-green-500' : conf >= 60 ? 'bg-yellow-500' : 'bg-blue-400';
-                        const label = bar.kind === 'match'
+                        const label = bar.kind === 'gapfill'
+                          ? `Seg ${bar.idx + 1} (recovered): ${fmt(bar.start)}–${fmt(bar.end)} (${conf.toFixed(0)}%)`
+                          : bar.kind === 'match'
                           ? `Seg ${bar.idx + 1}: ${fmt(bar.start)}–${fmt(bar.end)} (${conf.toFixed(0)}%)`
                           : `Unmatched: ${fmt(bar.start)}–${fmt(bar.end)}`;
                         return (
@@ -1459,6 +1469,7 @@ export default function App() {
                   <div className="flex items-center gap-4 text-[10px] text-slate-600">
                     <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-green-500" /> High confidence match</span>
                     <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-yellow-500" /> Medium confidence</span>
+                    <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-violet-500/70" /> Recovered (gap-fill)</span>
                     <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-orange-700/60" /> No match found</span>
                   </div>
                 </div>
@@ -1486,7 +1497,7 @@ export default function App() {
                     const isActive = previewSegment === seg;
                     return (
                       <tr key={i}
-                        className={`transition-colors hover:bg-slate-800/40 ${isActive ? 'bg-indigo-900/20 ring-1 ring-inset ring-indigo-500/30' : ''}`}>
+                        className={`transition-colors hover:bg-slate-800/40 ${isActive ? 'bg-indigo-900/20 ring-1 ring-inset ring-indigo-500/30' : seg.isGapFill ? 'bg-violet-950/10' : ''}`}>
                         <td className="px-4 py-3 font-mono text-slate-500 text-xs">{i + 1}</td>
 
                         {/* Clip time */}
@@ -1544,6 +1555,11 @@ export default function App() {
                         {/* Frame Similarity (confidence — unchanged, as-computed value) */}
                         <td className="px-4 py-3">
                           <ConfidenceBadge confidence={seg.confidence} isApproximate={seg.isApproximate} />
+                          {seg.isGapFill && (
+                            <div className="mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-semibold bg-violet-500/10 text-violet-400 border border-violet-500/25 uppercase tracking-wide">
+                              Recovered
+                            </div>
+                          )}
                         </td>
 
                         {/* Match Probability — separate statistical field, never replaces confidence */}

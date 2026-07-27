@@ -2659,6 +2659,7 @@ import * as path from 'path';
 import { getObjectSignal, compareObjectSignals, initObjectSignal } from './object-signal';
 import { getFaceSignal, compareFaceSignals, initFaceSignal } from './face-signal';
 import { getKeypointSignal, compareKeypointSignals, initKeypointSignal } from './keypoint-signal';
+import { getSubjectMask, compareSubjectSignals, initSubjectSignal } from './subject-signal';
 import { createCanvas, loadImage } from 'canvas';
 
 const execAsync = promisify(exec);
@@ -2718,6 +2719,7 @@ async function enhanceBorderlineSegments(result: MatchResult, shortResultPath: s
   await initFaceSignal();
   await initObjectSignal();
   initKeypointSignal();
+  await initSubjectSignal();
   
   const shortVideoPath = await getVideoPathFromResultPath(shortResultPath);
   const movieVideoPath = await getVideoPathFromResultPath(movieResultPath);
@@ -2814,6 +2816,62 @@ async function enhanceBorderlineSegments(result: MatchResult, shortResultPath: s
           ` keypointSim=${kpMatch.keypointSim.toFixed(1)}%).` +
           ` Boosted confidence to ${seg.confidence.toFixed(1)}%.`
         );
+      }
+    }
+
+    // ── Foreground subject signal ──────────────────────────────────────────────
+    // Runs AFTER all additive signals (face/object/keypoint), but only when the
+    // segment is still within the 55–75% borderline range (i.e. no prior boost).
+    // Unlike those signals this one can REDUCE confidence: if the background
+    // matches well but the main foreground subjects clearly differ, the match is
+    // likely a false positive driven by shared scenery.
+    //
+    // Uses MediaPipe ImageSegmenter (selfie_segmenter.tflite, ~230 KB, CPU).
+    // Docker size impact : +~230 KB model file, no new npm packages.
+    // Added second-pass time: ~15–60 ms per segment pair (model + histogram).
+    //
+    // Constraint: only operates within 55–75%; never touches segments that have
+    // already been boosted above or dropped below that range.
+    if (seg.confidence >= BORDERLINE_MIN && seg.confidence <= BORDERLINE_MAX) {
+      const subjectT0 = Date.now();
+      const shortSubject = getSubjectMask(shortImageData);
+      const movieSubject = getSubjectMask(movieImageData);
+      const subjectMs = Date.now() - subjectT0;
+
+      console.log(
+        `[SubjectSignal] Borderline match at frame ${frameMatch.shortTime.toFixed(2)}s` +
+        ` — coverage: short=${(shortSubject.maskCoverage * 100).toFixed(1)}%` +
+        ` movie=${(movieSubject.maskCoverage * 100).toFixed(1)}%` +
+        ` hasSubject: short=${shortSubject.hasSubject} movie=${movieSubject.hasSubject}` +
+        ` (${subjectMs} ms)`
+      );
+
+      if (!shortSubject.hasSubject && !movieSubject.hasSubject) {
+        // Pure background/landscape — no subject to compare; skip this signal.
+        console.log(
+          `[SubjectSignal] No distinct subject in either frame — skipping` +
+          ` (pure background/landscape scene).`
+        );
+      } else {
+        const comparison = compareSubjectSignals(shortSubject, movieSubject);
+        console.log(
+          `[SubjectSignal] subjectSim=${comparison.subjectSim.toFixed(1)}%` +
+          ` backgroundSim=${comparison.backgroundSim.toFixed(1)}%` +
+          ` isBackgroundOnlyMatch=${comparison.isBackgroundOnlyMatch}`
+        );
+
+        if (comparison.isBackgroundOnlyMatch) {
+          // Penalise: lower confidence below BORDERLINE_MIN to mark as rejected.
+          const SUBJECT_PENALTY = 20;
+          const prevConf = seg.confidence;
+          seg.confidence = Math.max(BORDERLINE_MIN - 6, seg.confidence - SUBJECT_PENALTY);
+          console.log(
+            `[SubjectSignal] Borderline match at frame ${frameMatch.shortTime.toFixed(2)}s` +
+            ` downgraded — background similarity high but subject regions disagree` +
+            ` (subjectSim=${comparison.subjectSim.toFixed(1)}%).` +
+            ` Confidence: ${prevConf.toFixed(1)}% → ${seg.confidence.toFixed(1)}%.`
+          );
+        }
       }
     }
   }

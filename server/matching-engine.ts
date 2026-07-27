@@ -16,6 +16,7 @@ import * as os from 'os';
 import * as readline from 'readline';
 import { FrameSignature, VariantHashes } from '../src/shared/fingerprint';
 import { loadEmbeddingsFile, cosineSimilarity } from './embedding';
+import { loadOrBuildHnswIndex, findNearestMovieFrames, hnswDistToSim100, MovieVectorIndex } from './vector-index';
 import { refineWithDTW } from './dtw-align';
 import { detectShotBoundaries, isShotBoundaryEnabled } from './shot-boundary';
 
@@ -1464,6 +1465,7 @@ export async function groundMatchedSegments(
   _prebuiltMovie?: PreSet,
   onProgress?: (info: MatchProgressInfo) => void,
   externalCuts?: Uint8Array,
+  hnswIndex?: MovieVectorIndex | null,
 ): Promise<MatchResult> {
   if (shortFps.length === 0 || movieFps.length === 0) {
     return { segments: [], unmatchedRanges: [] };
@@ -1586,6 +1588,45 @@ export async function groundMatchedSegments(
           } else {
             lastCand = { mi, sim: s };
             cands.push(lastCand);
+          }
+        }
+
+        // ── HNSW vector-search augmentation ────────────────────────────────
+        // After the hash scan, query the HNSW index to surface candidate movie
+        // regions the sequential walk might miss (e.g. heavy speed variation
+        // placing the true match far outside the hash-drift window).
+        // Gated on ENABLE_CLIP_MATCHING — hnswIndex is null when CLIP is off.
+        if (hnswIndex && sSet.embFlat && sSet.embDim > 0) {
+          const eOff = si * sSet.embDim;
+          if (eOff + sSet.embDim <= sSet.embFlat.length) {
+            const shortEmb = sSet.embFlat.subarray(eOff, eOff + sSet.embDim);
+            const t0Hnsw   = Date.now();
+            const hnswHits = findNearestMovieFrames(hnswIndex, shortEmb, 20);
+            const queryMs  = Date.now() - t0Hnsw;
+            let newCount   = 0;
+            for (const hc of hnswHits) {
+              const sim100 = hnswDistToSim100(hc.distance);
+              if (sim100 < fastFloor) continue;
+              const alreadyCovered = cands.some(
+                c => Math.abs(c.mi - hc.movieFrameIndex) < SEED_SEPARATION
+              );
+              if (!alreadyCovered) {
+                cands.push({ mi: hc.movieFrameIndex, sim: sim100 });
+                newCount++;
+                console.log(
+                  `[VectorIndex] HNSW found alternate candidate movie region at` +
+                  ` ${movieFps[hc.movieFrameIndex]?.timestamp?.toFixed(2)}s` +
+                  ` for short-clip chunk [${shortFps[chunk.start]?.timestamp?.toFixed(2)}-${shortFps[chunk.end]?.timestamp?.toFixed(2)}s]` +
+                  ` (not reached by sequential walk) — passed to standard matching pipeline for verification.`
+                );
+              }
+            }
+            if (newCount > 0) {
+              console.log(
+                `[VectorIndex] HNSW query (si=${si}): ${newCount} new candidate(s)` +
+                ` added in ${queryMs} ms (${hnswHits.length} hits evaluated).`
+              );
+            }
           }
         }
 
@@ -2228,6 +2269,7 @@ async function groundMatchedSegmentsChunked(
   frameDrift:     number,
   onProgress?:    (info: MatchProgressInfo) => void,
   externalCuts?:  Uint8Array,
+  hnswIndex?:     MovieVectorIndex | null,
 ): Promise<MatchResult> {
   const CHUNK_FRAMES = 10_000;  // movie frames per scan window (~4 MB aFlat for 13v/8w)
   const WALK_WINDOW  = 3_000;   // half-width around each seed for the bidirectional walk
@@ -2316,6 +2358,56 @@ async function groundMatchedSegmentsChunked(
   for (const [, list] of allCands) {
     list.sort((a, b) => b.sim - a.sim);
     if (list.length > MAX_SEED_CANDIDATES) list.splice(MAX_SEED_CANDIDATES);
+  }
+
+  // ── HNSW vector-search augmentation ──────────────────────────────────────
+  // After the full sequential hash scan, query the HNSW index for each seed
+  // position to surface candidate movie regions the chunk-by-chunk scan might
+  // have missed entirely (e.g. due to large speed variation beyond the drift
+  // window).  New HNSW candidates are merged into allCands and flow through
+  // the same Passes 1/2/3 pipeline — identical quality bar, no special treatment.
+  // Gated on ENABLE_CLIP_MATCHING — hnswIndex is null when CLIP is off.
+  if (hnswIndex && shortSet.embFlat && shortSet.embDim > 0) {
+    const tHnsw0   = Date.now();
+    let   totalNew = 0;
+
+    for (const si of seedSiSet) {
+      const eOff = si * shortSet.embDim;
+      if (eOff + shortSet.embDim > shortSet.embFlat.length) continue;
+
+      const shortEmb = shortSet.embFlat.subarray(eOff, eOff + shortSet.embDim);
+      const hnswHits = findNearestMovieFrames(hnswIndex, shortEmb, 20);
+      const existing = allCands.get(si) ?? [];
+
+      for (const hc of hnswHits) {
+        const sim100 = hnswDistToSim100(hc.distance);
+        if (sim100 < fastFloor) continue;
+        const alreadyCovered = existing.some(
+          c => Math.abs(c.mi - hc.movieFrameIndex) < SEED_SEPARATION
+        );
+        if (!alreadyCovered) {
+          existing.push({ mi: hc.movieFrameIndex, sim: sim100 });
+          totalNew++;
+          // Find the scene chunk this seed belongs to for context in the log message
+          const sc = chunks.find(c => si >= c.start && si <= c.end);
+          console.log(
+            `[VectorIndex] HNSW found alternate candidate movie region at` +
+            ` ${movieMetaFps[hc.movieFrameIndex]?.timestamp?.toFixed(2)}s` +
+            ` for short-clip chunk [${shortFps[sc?.start ?? si]?.timestamp?.toFixed(2)}-${shortFps[sc?.end ?? si]?.timestamp?.toFixed(2)}s]` +
+            ` (not reached by sequential walk) — passed to standard matching pipeline for verification.`
+          );
+        }
+      }
+
+      existing.sort((a, b) => b.sim - a.sim);
+      if (existing.length > MAX_SEED_CANDIDATES) existing.splice(MAX_SEED_CANDIDATES);
+      allCands.set(si, existing);
+    }
+
+    console.log(
+      `[VectorIndex] HNSW augmentation complete: ${totalNew} new candidate(s)` +
+      ` across ${seedSiSet.size} seed position(s) — ${Date.now() - tHnsw0} ms.`
+    );
   }
 
   // ── 3. Passes 1 & 2: walk from seeds ─────────────────────────────────────
@@ -2605,10 +2697,34 @@ export async function matchVideosFromFiles(
       } catch { /* skip */ }
     }
 
+    // ── Build HNSW vector index (chunked path) ────────────────────────────────
+    // The full movie PreSet is not loaded on the chunked path, but CLIP embeddings
+    // are in a separate sidecar (.embeddings.bin) — load that directly to build
+    // the index.  One-time build; cached to *_result.json.hnsw.bin.  Skipped when
+    // the sidecar is absent or CLIP is off.
+    let movieHnswIndex: MovieVectorIndex | null = null;
+    if (shortPreSet.embDim > 0) {
+      const movieEmbFlat = loadEmbeddingsFile(movieResultPath + '.embeddings.bin');
+      if (movieEmbFlat && movieEmbFlat.length > 0) {
+        const movieEmbDim = Math.floor(movieEmbFlat.length / movieFrames);
+        if (movieEmbDim === shortPreSet.embDim && movieEmbDim > 0) {
+          movieHnswIndex = await loadOrBuildHnswIndex(
+            movieEmbFlat, movieEmbDim, movieResultPath + '.hnsw.bin'
+          );
+        } else {
+          console.warn(
+            `[VectorIndex] Chunked path: movie embedding dim ${movieEmbDim}` +
+            ` ≠ short ${shortPreSet.embDim} — HNSW skipped.`
+          );
+        }
+      }
+    }
+
     onProgress?.({ phase: 'scanning', pct: 20 });
     let result = await groundMatchedSegmentsChunked(
       shortPreSet, movieResultPath, byteOffsets, movieMetaFps, meta,
-      minSimilarity, minConsecutiveFrames, frameDrift, onProgress, transNetV2Cuts
+      minSimilarity, minConsecutiveFrames, frameDrift, onProgress, transNetV2Cuts,
+      movieHnswIndex,
     );
     result = await enhanceBorderlineSegments(result, shortResultPath, movieResultPath);
     return { ...result, movieFrames, shortFrames };
@@ -2621,6 +2737,19 @@ export async function matchVideosFromFiles(
 
   // Attach CLIP embeddings for movie (full-load path only)
   attachEmbeddings(moviePreSet, movieResultPath);
+
+  // ── Build HNSW vector index (full-load path) ──────────────────────────────
+  // One-time build per movie upload; cached to *_result.json.hnsw.bin.
+  // Subsequent matches load the cache in < 200 ms rather than rebuilding.
+  // Query cost per short-clip chunk: < 1 ms at ef=64.  Skipped when CLIP off.
+  let movieHnswIndex: MovieVectorIndex | null = null;
+  if (shortPreSet.embDim > 0 && moviePreSet.embDim > 0 &&
+      shortPreSet.embDim === moviePreSet.embDim) {
+    const hnswCachePath = movieResultPath + '.hnsw.bin';
+    movieHnswIndex = await loadOrBuildHnswIndex(
+      moviePreSet.embFlat, moviePreSet.embDim, hnswCachePath
+    );
+  }
 
   const clipStatus = (shortPreSet.embDim > 0 && moviePreSet.embDim > 0)
     ? `CLIP on (dim=${shortPreSet.embDim})`
@@ -2641,6 +2770,7 @@ export async function matchVideosFromFiles(
     moviePreSet,
     onProgress,
     transNetV2Cuts,
+    movieHnswIndex,
   );
 
   result = await enhanceBorderlineSegments(result, shortResultPath, movieResultPath);

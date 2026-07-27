@@ -233,8 +233,8 @@ const MAX_SEED_CANDIDATES = 8;
  * Bounds are generous enough to accept genuine slow-motion (0.5×) and
  * timelapse/sped-up (2×) edits while reliably rejecting the ~0.1 cluster.
  */
-const MIN_SPEED_RATIO = 0.6;  // relaxed from 0.75 — frame-drift / minor re-encode shifts slope slightly
-const MAX_SPEED_RATIO = 1.6;  // relaxed from 1.25 — same tolerance on the fast side
+const MIN_SPEED_RATIO = 0.25; // very permissive — only rejects true ~0.1 stuck-frame clusters
+const MAX_SPEED_RATIO = 4.0;  // very permissive — same on the fast side
 /** Candidates closer than this many movie frames are merged (2 s @ 25 fps) */
 const SEED_SEPARATION = 50;
 

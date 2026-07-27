@@ -186,12 +186,10 @@ export function processSubtitles(
     }
   }
   
-  // Compute maskCoverage: fraction of total frame pixels that were inpainted
-  let dilatedCount = 0;
-  const totalPixels = width * height;
-  // Re-scan to count dilated pixels (approximate — reuse the mask before dilating)
-  // We use subtitlePixelCount as a proxy; dilated area is larger but similar proportion
-  const maskCoverage = subtitlePixelCount / totalPixels;
+  // maskCoverage: fraction of total frame pixels that were subtitle-masked.
+  // subtitlePixelCount (raw bright pixels) is a conservative proxy; the dilated
+  // inpaint area is slightly larger, but the same order of magnitude.
+  const maskCoverage = subtitlePixelCount / (width * height);
 
   return { changed: true, maskCoverage };
 }

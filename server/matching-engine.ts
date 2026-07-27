@@ -233,8 +233,8 @@ const MAX_SEED_CANDIDATES = 8;
  * Bounds are generous enough to accept genuine slow-motion (0.5×) and
  * timelapse/sped-up (2×) edits while reliably rejecting the ~0.1 cluster.
  */
-const MIN_SPEED_RATIO = 0.75; // FIX-3: tightened from 0.4 — rejects stuck-frame artifacts
-const MAX_SPEED_RATIO = 1.25; // FIX-3: tightened from 2.5 — real edits stay in this range
+const MIN_SPEED_RATIO = 0.6;  // relaxed from 0.75 — frame-drift / minor re-encode shifts slope slightly
+const MAX_SPEED_RATIO = 1.6;  // relaxed from 1.25 — same tolerance on the fast side
 /** Candidates closer than this many movie frames are merged (2 s @ 25 fps) */
 const SEED_SEPARATION = 50;
 
@@ -1142,7 +1142,8 @@ function walkOneDir(
           console.log(
             `[Matcher] Walk stopped early (direction=${direction}) at short=` +
             `${sSet.fps[nextSi].timestamp.toFixed(2)}s` +
-            ` — movie frame stagnated (bestMi≈${lastGoodMi}) for >2 consecutive steps.`
+            ` — movie frame stagnated (bestMi≈${lastGoodMi}) for >2 consecutive steps` +
+            ` (frameSim at stall=${best.toFixed(1)}%).`
           );
           break;
         }
@@ -1416,13 +1417,35 @@ function speedRatioFilterSegments(segs: MatchedSegment[]): MatchedSegment[] {
   for (const seg of segs) {
     if (seg.speedRatio >= MIN_SPEED_RATIO && seg.speedRatio <= MAX_SPEED_RATIO) {
       out.push(seg);
-    } else {
-      console.log(
-        `[Matcher] SpeedRatio-drop: seg [${seg.shortStart.toFixed(2)}–` +
-        `${seg.shortEnd.toFixed(2)}s] speedRatio=${seg.speedRatio.toFixed(3)}` +
-        ` — implausible duration ratio, rejected.`
-      );
+      continue;
     }
+
+    // Rescue pass: if the speedRatio is exactly at a SLOPE clamp boundary (0.1 or 8.0),
+    // the walk stagnated and computeRegressionSlope hit the clamp — the number is an
+    // artifact, not a real speed measurement.  When the raw frame similarity is still
+    // high (≥75 %), the frames are genuinely matching and the segment should survive.
+    const atClampBoundary = seg.speedRatio <= SLOPE_MIN || seg.speedRatio >= SLOPE_MAX;
+    if (atClampBoundary) {
+      const rawAvgSim = seg.matchSequence.length > 0
+        ? seg.matchSequence.reduce((s, f) => s + f.similarity, 0) / seg.matchSequence.length
+        : 0;
+      if (rawAvgSim >= 75) {
+        console.log(
+          `[Matcher] SpeedRatio-rescue: seg [${seg.shortStart.toFixed(2)}–` +
+          `${seg.shortEnd.toFixed(2)}s] speedRatio=${seg.speedRatio.toFixed(3)}` +
+          ` (clamp-boundary artifact) rawAvgSim=${rawAvgSim.toFixed(1)}% ≥ 75%` +
+          ` — keeping segment.`
+        );
+        out.push(seg);
+        continue;
+      }
+    }
+
+    console.log(
+      `[Matcher] SpeedRatio-drop: seg [${seg.shortStart.toFixed(2)}–` +
+      `${seg.shortEnd.toFixed(2)}s] speedRatio=${seg.speedRatio.toFixed(3)}` +
+      ` — implausible duration ratio, rejected.`
+    );
   }
   return out;
 }

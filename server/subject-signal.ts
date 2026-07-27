@@ -22,6 +22,13 @@ import * as fs    from 'fs';
 import * as https from 'https';
 import * as http  from 'http';
 
+// MediaPipe tasks-vision reads `navigator.userAgent` during FilesetResolver
+// initialisation, which doesn't exist in Node.js.  Polyfill it here so that
+// initSubjectSignal() works in server-side environments.
+if (typeof (globalThis as any).navigator === 'undefined') {
+  (globalThis as any).navigator = { userAgent: 'Node.js' };
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /**

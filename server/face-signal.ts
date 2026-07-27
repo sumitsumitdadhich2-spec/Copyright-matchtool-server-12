@@ -1,6 +1,13 @@
 import { FaceLandmarker, HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 import path from 'path';
 
+// MediaPipe tasks-vision reads `navigator.userAgent` during FilesetResolver
+// initialisation, which doesn't exist in Node.js.  Polyfill it here so that
+// initFaceSignal() works in server-side (no-browser) environments.
+if (typeof (globalThis as any).navigator === 'undefined') {
+  (globalThis as any).navigator = { userAgent: 'Node.js' };
+}
+
 
 
 

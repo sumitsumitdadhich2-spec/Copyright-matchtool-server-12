@@ -355,10 +355,25 @@ export function refineWithDTW(
     if (miEnd < miStart) [miStart, miEnd] = [miEnd, miStart];
 
     // ── Expand movie region with buffer ───────────────────────────────────
-    const baseSpan = Math.max(1, miEnd - miStart);
-    const bufSize  = Math.min(DTW_BUFFER_FRAMES, Math.round(baseSpan * 0.20));
+    // For implausible-speed segments the walk likely stagnated: the movie span
+    // can be nearly 0 frames (speedRatio≈0.1 → the walk compressed a 5-second
+    // short against <1 second of movie).  Using 20% of that tiny span as the
+    // buffer (≈0 frames) means DTW searches the wrong region entirely.
+    // Instead, use the short-clip frame count as the expected span when the
+    // segment's movie span is implausibly compressed.
+    const baseSpan    = Math.max(1, miEnd - miStart);
+    const effectiveSpan = isImplausibleSpeed
+      ? Math.max(baseSpan, siIndices.length)   // assume ~1:1 speed as fallback
+      : baseSpan;
+    const bufSize  = Math.min(DTW_BUFFER_FRAMES, Math.round(effectiveSpan * 0.20));
     let   adjLo    = Math.max(0,                    miStart - bufSize);
     let   adjHi    = Math.min(movieFps.length - 1,  miEnd   + bufSize);
+    // Guarantee the window covers at least effectiveSpan frames for implausible speed
+    if (isImplausibleSpeed && adjHi - adjLo < effectiveSpan) {
+      const centre = Math.round((adjLo + adjHi) / 2);
+      adjLo = Math.max(0, centre - Math.floor(effectiveSpan / 2));
+      adjHi = Math.min(movieFps.length - 1, adjLo + effectiveSpan);
+    }
 
     // ── Apply cell cap: shrink movie region toward its centre if needed ───
     const n = siIndices.length;

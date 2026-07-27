@@ -2,6 +2,13 @@ import { ObjectDetector, FilesetResolver } from '@mediapipe/tasks-vision';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+// MediaPipe tasks-vision reads `navigator.userAgent` during FilesetResolver
+// initialisation, which doesn't exist in Node.js.  Polyfill it here so that
+// initObjectSignal() works in server-side environments.
+if (typeof (globalThis as any).navigator === 'undefined') {
+  (globalThis as any).navigator = { userAgent: 'Node.js' };
+}
+
 let objectDetector: ObjectDetector | null = null;
 
 export async function initObjectSignal() {

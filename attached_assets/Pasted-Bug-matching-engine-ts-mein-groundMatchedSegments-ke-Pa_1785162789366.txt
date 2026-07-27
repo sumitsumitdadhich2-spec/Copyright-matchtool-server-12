@@ -1,0 +1,47 @@
+Bug: matching-engine.ts mein groundMatchedSegments() ke Pass 1-3 se 17 candidate 
+segments nikal rahe hain, lekin speedRatioFilterSegments() (constants MIN_SPEED_RATIO=0.75, 
+MAX_SPEED_RATIO=1.25 near line 236-237) unn 17 mein se 16 ko drop kar deta hai kyunki 
+unka computed speedRatio SLOPE_MIN=0.1 ya SLOPE_MAX=8.0 pe clamp ho raha hai 
+(computeRegressionSlope, line ~1013-1030).
+
+Root cause: walkOneDir() ke andar movie-frame index baar baar "stagnate" ho raha hai 
+(log mein "movie frame stagnated (bestMi≈X) for >2 consecutive steps" 300+ baar aa raha 
+hai) — yani short clip ke frames aage badh rahe hain lekin best-matching movie frame same 
+position pe atka reh raha hai ya bahut door jump kar raha hai. Isse regression slope 
+implausible (0.1 ya 2-8x) ban raha hai, jo asal mein sahi speedRatio nahi balki ek matching 
+artifact hai.
+
+Fix chahiye (in order of priority):
+
+1. speedRatioFilterSegments() ko turant strict reject karne ki jagah, pehle un segments 
+   ke liye jinka speedRatio clamp-boundary (0.1 ya 8.0) ke exactly bahut kareeb hai, 
+   unhe "low confidence" flag karo — turant drop mat karo. Instead, unke actual raw 
+   frame-pair similarity (hashSimBestCross se) ko dobara check karo — agar avg similarity 
+   filter threshold (jaise ≥75-80%) se upar hai, toh segment ko rakho chahe speedRatio 
+   thoda off ho, kyunki real 1:1-speed match ka slope ~1.0 hona chahiye tha.
+
+2. MIN_SPEED_RATIO/MAX_SPEED_RATIO ko thoda relax karo — abhi 0.75-1.25 bahut tight hai. 
+   Same-fps same-content clips ke liye bhi thoda tolerance chahiye (jaise 0.6-1.6), kyunki 
+   frame-drift ya minor re-encode se bhi slope thoda shift ho sakta hai.
+
+3. walkOneDir() / frameStagnationFilter() debug karo — jab movie frame repeatedly stagnate 
+   ho raha ho, uska matlab hai ki us short-clip segment ke liye sahi movie match hi nahi mil 
+   raha (ya wrong region match ho raha hai). Console logs add karo jo dikhaye ki stagnation 
+   ke waqt actual frameSim() values kya thi — taaki pata chale ye false-negative hai ya 
+   genuinely weak match hai.
+
+4. DTW refinement (refineWithDTW, dtw-align.ts) 14 mein se sirf 4 segments ko fix kar 
+   paya — baaki 10 mein "DTW did not find a better alignment" aaya. DTW ke search window 
+   ya cost-normalization thresholds check karo, ho sakta hai window bahut narrow ho aur 
+   sahi alignment window ke bahar ho.
+
+5. Bonus fix (unrelated crash but visible in logs): FaceSignal/ObjectSignal/SubjectSignal 
+   MediaPipe tasks-vision ko "navigator is not defined" error de rahe hain kyunki ye 
+   Node.js server environment mein chal rahe hain jahan browser 'navigator' global exist 
+   nahi karta. Inhe polyfill do (global.navigator = {} ya similar) ya inhe purely-Node 
+   compatible detection library se replace karo, taaki enhanceBorderlineSegments() borderline 
+   segments ko properly enhance kar sake instead of silently failing.
+
+Goal: currently pipeline 17 real matched candidate segments nikal raha hai lekin filter 
+overly-aggressive hone ki wajah se sirf 1 bachta hai. Chahiye ki genuine matches survive 
+karein aur sirf actual false-positives (jaise different unrelated movie regions) drop hon.

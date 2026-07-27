@@ -23,6 +23,14 @@ RUN mkdir -p models && \
       -o models/clip_vision_quantized.onnx || \
     echo "WARNING: CLIP model download failed — runtime will re-attempt on first use"
 
+# ── Download TransNetV2 model so the image is self-contained ────────────────
+# elya5/transnetv2 ONNX export (~31 MB, MIT licence).
+# The path must match TRANSNETV2_MODEL_PATH in server/shot-boundary.ts.
+RUN curl -fL \
+      "https://huggingface.co/elya5/transnetv2/resolve/main/transnetv2.onnx" \
+      -o models/transnetv2.onnx || \
+    echo "WARNING: TransNetV2 model download failed — runtime will re-attempt on first use"
+
 # Copy the rest of the application
 COPY . .
 

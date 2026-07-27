@@ -4,3 +4,4 @@
 - [Sanity test design](sanity-test-design.md) — test must compare worker-to-worker (determinism), not main-thread vs worker (different pipelines).
 - [RAM management](ram-management.md) — extraction queue limit must be dynamic (frame resolution × count); hardcoded 100 crashes 8 GB RAM with 4K video. Matching uses chunked path auto when estimated PreSet > 4 GB.
 - [Imported dependency preservation](imported-dependency-preservation.md) — package installation can rewrite direct dependency ranges; restore the imported manifest when setup should stay minimal.
+- [TransNetV2 shot boundary integration](transnetv2-shot-boundary.md) — model, input/output shape, sliding-window design, integration points, and feature flag.

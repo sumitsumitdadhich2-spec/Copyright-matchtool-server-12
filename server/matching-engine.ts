@@ -17,6 +17,7 @@ import * as readline from 'readline';
 import { FrameSignature, VariantHashes } from '../src/shared/fingerprint';
 import { loadEmbeddingsFile, cosineSimilarity } from './embedding';
 import { refineWithDTW } from './dtw-align';
+import { detectShotBoundaries, isShotBoundaryEnabled } from './shot-boundary';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -1462,6 +1463,7 @@ export async function groundMatchedSegments(
   _prebuiltShort?: PreSet,
   _prebuiltMovie?: PreSet,
   onProgress?: (info: MatchProgressInfo) => void,
+  externalCuts?: Uint8Array,
 ): Promise<MatchResult> {
   if (shortFps.length === 0 || movieFps.length === 0) {
     return { segments: [], unmatchedRanges: [] };
@@ -1480,13 +1482,32 @@ export async function groundMatchedSegments(
   const tEnabled    = sSet.tDelta !== null && mSet.tDelta !== null;
   console.log(`[Matcher] Feature channels: dHash=${dEnabled ? 'on' : 'off'} flipDetect=${flipEnabled ? 'on' : 'off'} temporalMotion=${tEnabled ? 'on' : 'off'}`);
 
-  // Scene cut detection — multi-signal
-  const isCut   = detectSceneCuts(sSet);
-  const numCuts = isCut.reduce((n, v) => n + v, 0);
+  // Scene cut detection — multi-signal (threshold-based)
+  const isCut            = detectSceneCuts(sSet);
+  const numThresholdCuts = isCut.reduce((n, v) => n + v, 0);
+
+  // OR in TransNetV2 shot boundaries (strictly additive — never removes existing cuts)
+  if (externalCuts) {
+    for (let i = 1; i < Math.min(isCut.length, externalCuts.length); i++) {
+      if (externalCuts[i] && !isCut[i]) {
+        isCut[i] = 1;
+        console.log(
+          `[ShotBoundary] TransNetV2 detected additional cut at frame ${i}` +
+          ` (t=${shortFps[i]?.timestamp.toFixed(2)}s, missed by threshold-based detectSceneCuts).`
+        );
+      }
+    }
+  }
+  const numCuts          = isCut.reduce((n, v) => n + v, 0);
+  const numTransNetCuts  = numCuts - numThresholdCuts;
 
   // Split short clip into scene chunks
   const chunks = splitBySceneCuts(shortFps, isCut);
-  console.log(`[Matcher] Detected ${numCuts} scene cut(s) → ${chunks.length} scene chunk(s).`);
+  console.log(
+    `[Matcher] Scene cuts: ${numThresholdCuts} threshold-based` +
+    (numTransNetCuts > 0 ? ` + ${numTransNetCuts} TransNetV2` : '') +
+    ` = ${numCuts} total → ${chunks.length} chunk(s).`
+  );
 
   console.log('[Matcher] Precompute done. Starting scene-chunk scan…');
 
@@ -2206,6 +2227,7 @@ async function groundMatchedSegmentsChunked(
   minConsFrames:  number,
   frameDrift:     number,
   onProgress?:    (info: MatchProgressInfo) => void,
+  externalCuts?:  Uint8Array,
 ): Promise<MatchResult> {
   const CHUNK_FRAMES = 10_000;  // movie frames per scan window (~4 MB aFlat for 13v/8w)
   const WALK_WINDOW  = 3_000;   // half-width around each seed for the bidirectional walk
@@ -2215,10 +2237,29 @@ async function groundMatchedSegmentsChunked(
   const fastFloor        = minSimilarity - 20;
 
   // ── 1. Scene cut detection on short clip ─────────────────────────────────
-  const isCut  = detectSceneCuts(shortSet);
+  const isCut            = detectSceneCuts(shortSet);
+  const numThresholdCuts = isCut.reduce((n, v) => n + v, 0);
+
+  // OR in TransNetV2 shot boundaries (strictly additive)
+  if (externalCuts) {
+    for (let i = 1; i < Math.min(isCut.length, externalCuts.length); i++) {
+      if (externalCuts[i] && !isCut[i]) {
+        isCut[i] = 1;
+        console.log(
+          `[ShotBoundary] TransNetV2 detected additional cut at frame ${i}` +
+          ` (t=${shortFps[i]?.timestamp.toFixed(2)}s, missed by threshold-based detectSceneCuts).`
+        );
+      }
+    }
+  }
+  const numCuts         = isCut.reduce((n, v) => n + v, 0);
+  const numTransNetCuts = numCuts - numThresholdCuts;
+
   const chunks = splitBySceneCuts(shortFps, isCut);
   console.log(
-    `[MatchChunked] ${chunks.length} scene chunk(s) in short clip.` +
+    `[MatchChunked] Scene cuts: ${numThresholdCuts} threshold-based` +
+    (numTransNetCuts > 0 ? ` + ${numTransNetCuts} TransNetV2` : '') +
+    ` = ${numCuts} total → ${chunks.length} chunk(s).` +
     ` Scanning ${totalMovieFrames} movie frames in chunks of ${CHUNK_FRAMES}…`
   );
 
@@ -2509,6 +2550,21 @@ export async function matchVideosFromFiles(
   // ── Attach CLIP embeddings for short clip (both paths benefit) ────────────
   attachEmbeddings(shortPreSet, shortResultPath);
 
+  // ── TransNetV2 shot boundary detection (additive signal, short clip only) ─
+  // Runs once regardless of which matching path is used.  The result is OR'd
+  // with the threshold-based detectSceneCuts inside groundMatchedSegments /
+  // groundMatchedSegmentsChunked — it never removes an existing cut.
+  let transNetV2Cuts: Uint8Array | undefined;
+  if (isShotBoundaryEnabled()) {
+    const shortVideoPath = await getVideoPathFromResultPath(shortResultPath);
+    if (shortVideoPath) {
+      const cuts = await detectShotBoundaries(shortVideoPath, shortFrames);
+      if (cuts) transNetV2Cuts = cuts;
+    } else {
+      console.warn('[ShotBoundary] Could not resolve video path for short clip — TransNetV2 skipped.');
+    }
+  }
+
   // ── Decide: full load vs chunked ──────────────────────────────────────────
   // Peek at movie frame count via line index (fast: one sequential pass).
   // This also gives us byte offsets ready for the chunked path if needed.
@@ -2552,7 +2608,7 @@ export async function matchVideosFromFiles(
     onProgress?.({ phase: 'scanning', pct: 20 });
     let result = await groundMatchedSegmentsChunked(
       shortPreSet, movieResultPath, byteOffsets, movieMetaFps, meta,
-      minSimilarity, minConsecutiveFrames, frameDrift, onProgress
+      minSimilarity, minConsecutiveFrames, frameDrift, onProgress, transNetV2Cuts
     );
     result = await enhanceBorderlineSegments(result, shortResultPath, movieResultPath);
     return { ...result, movieFrames, shortFrames };
@@ -2584,6 +2640,7 @@ export async function matchVideosFromFiles(
     shortPreSet,
     moviePreSet,
     onProgress,
+    transNetV2Cuts,
   );
 
   result = await enhanceBorderlineSegments(result, shortResultPath, movieResultPath);
